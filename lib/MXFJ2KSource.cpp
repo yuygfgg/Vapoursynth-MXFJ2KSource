@@ -59,6 +59,11 @@ static constexpr int VAPOURSYNTH_RGB36_BITS = 12;
 static constexpr uint8_t PRECISION_LIMIT_BITS = 32;
 static constexpr size_t FRAME_INDEX_RESERVE = 4096;
 
+static void grok_init_once() {
+    static std::once_flag once;
+    std::call_once(once, []() { grk_initialize(nullptr, 0, nullptr); });
+}
+
 struct FrameIndex {
     uint64_t value_offset = 0; // file offset of KLV value (payload start)
     uint32_t value_size = 0;   // KLV value length in bytes
@@ -139,8 +144,6 @@ probe_mxf_video_track(const std::string& path) {
         }
 
         Partition& header_partition = file->getPartition(0);
-        // We expect OP1a for DCP, but don’t hard-fail here
-        (void)header_partition;
 
         auto data_model = std::make_unique<DataModel>();
         auto header_metadata =
@@ -232,10 +235,6 @@ struct KLVHeader {
 
 static std::expected<void, std::string>
 skip_bytes(MXFFile* file, int64_t file_size, uint64_t len) {
-    if (file == nullptr) {
-        return std::unexpected("Null MXF file handle");
-    }
-
     if (len == 0) {
         return {};
     }
@@ -266,22 +265,17 @@ skip_bytes(MXFFile* file, int64_t file_size, uint64_t len) {
 
 static std::expected<std::optional<KLVHeader>, std::string>
 read_klv_header(MXFFile* file, int64_t file_size) {
-    if (file == nullptr) {
-        return std::unexpected("Null MXF file handle");
-    }
-
     const int64_t pos = mxf_file_tell(file);
     if (pos < 0) {
         return std::unexpected("mxf_file_tell failed");
     }
 
-    // A valid KL must have at least 16 bytes of key + 1 byte of length.
     if (file_size >= 0) {
         if (pos >= file_size) {
-            return std::optional<KLVHeader>{};
+            return std::nullopt;
         }
         if ((file_size - pos) < MXF_MIN_KL_BYTES) {
-            return std::optional<KLVHeader>{};
+            return std::nullopt;
         }
     }
 
@@ -290,7 +284,7 @@ read_klv_header(MXFFile* file, int64_t file_size) {
     const auto want_key = static_cast<uint32_t>(key_bytes.size());
     const uint32_t got_key = mxf_file_read(file, key_bytes.data(), want_key);
     if (got_key == 0) {
-        return std::optional<KLVHeader>{}; // EOF
+        return std::nullopt;
     }
     if (got_key != want_key) {
         return std::unexpected("Truncated MXF while reading KLV key");
@@ -358,7 +352,7 @@ read_next_nonfiller_klv_header(MXFFile* file, int64_t file_size) {
             return std::unexpected(hdr_exp.error());
         }
         if (!*hdr_exp) {
-            return std::optional<KLVHeader>{}; // EOF
+            return std::nullopt;
         }
 
         KLVHeader h = **hdr_exp;
@@ -374,16 +368,10 @@ read_next_nonfiller_klv_header(MXFFile* file, int64_t file_size) {
 
 static std::expected<uint16_t, std::string>
 detect_and_set_runin_len(MXFFile* file) {
-    if (file == nullptr) {
-        return std::unexpected("Null MXF file handle");
-    }
-
     if (mxf_file_seek(file, 0, SEEK_SET) == 0) {
         return std::unexpected("mxf_file_seek failed");
     }
 
-    // Scan for the first 11 bytes of the partition pack label.
-    // See libMXF's mxf_read_header_pp_kl_with_runin.
     static constexpr std::array<uint8_t, PARTITION_LABEL_PREFIX_BYTES> PREFIX{
         0x06, 0x0e, 0x2b, 0x34, 0x02, 0x05, 0x01};
     static constexpr std::array<uint8_t, PARTITION_LABEL_SUFFIX_BYTES> SUFFIX{
@@ -400,15 +388,14 @@ detect_and_set_runin_len(MXFFile* file) {
         const auto b = static_cast<uint8_t>(ch);
         bool ok = false;
         if (matched < PREFIX.size()) {
-            ok = b == PREFIX.at(matched);
+            ok = b == PREFIX[matched];
         } else if (matched == PARTITION_LABEL_REGVER_OFFSET) {
-            // regver
             ok = (b == PARTITION_LABEL_REGVER_1) ||
                  (b == PARTITION_LABEL_REGVER_2);
         } else {
             const size_t suffix_index =
                 static_cast<size_t>(matched) - (PREFIX.size() + 1U);
-            ok = b == SUFFIX.at(suffix_index);
+            ok = b == SUFFIX[suffix_index];
         }
 
         if (ok) {
@@ -436,8 +423,6 @@ index_j2k_essence_frames(const std::string& path,
         MXFFile* file = f.get();
         const int64_t file_size = mxf_file_size(file);
 
-        // Best-effort run-in detection. If it fails, we still attempt to parse
-        // from offset 0.
         (void)detect_and_set_runin_len(file);
         if (mxf_file_seek(file, mxf_get_runin_len(file), SEEK_SET) == 0) {
             return std::unexpected("mxf_file_seek failed");
@@ -452,7 +437,7 @@ index_j2k_essence_frames(const std::string& path,
                 return std::unexpected(kl_exp.error());
             }
             if (!*kl_exp) {
-                break; // EOF
+                break;
             }
 
             const KLVHeader kl = **kl_exp;
@@ -462,35 +447,33 @@ index_j2k_essence_frames(const std::string& path,
 
             if (mxf_is_gc_essence_element(&key) != 0) {
                 const uint32_t track_number = mxf_get_track_number(&key);
-                const bool track_ok = !desired_track_number ||
-                                      track_number == *desired_track_number;
-
-                if (track_ok) {
+                if (!desired_track_number ||
+                    track_number == *desired_track_number) {
                     if (len > std::numeric_limits<uint32_t>::max()) {
                         return std::unexpected(
                             "Essence KLV too large for in-memory decode");
                     }
 
-                    // Light validation when track is unknown: sniff SOC marker.
                     bool accept = true;
                     if (!desired_track_number) {
+                        const uint32_t sniff = static_cast<uint32_t>(
+                            std::min<uint64_t>(len, J2K_SOC_MARKER_SIZE));
                         std::array<uint8_t, J2K_SOC_MARKER_SIZE> prefix{};
-                        const auto want_prefix =
-                            static_cast<uint32_t>(prefix.size());
-                        const uint32_t nread =
-                            mxf_file_read(file, prefix.data(), want_prefix);
-                        accept = (nread == want_prefix) &&
+                        uint32_t nread = 0;
+                        if (sniff != 0) {
+                            nread = mxf_file_read(file, prefix.data(), sniff);
+                        }
+                        if (nread != sniff) {
+                            return std::unexpected(
+                                "Truncated MXF while reading essence prefix");
+                        }
+
+                        accept = (sniff == J2K_SOC_MARKER_SIZE) &&
                                  looks_like_j2k_codestream_prefix(prefix);
-                        // Skip the rest of the KLV value.
-                        if (len >= nread) {
-                            if (auto skip_exp =
-                                    skip_bytes(file, file_size, len - nread);
-                                !skip_exp) {
-                                return std::unexpected(skip_exp.error());
-                            }
-                        } else {
-                            // Corrupt length; treat as rejected.
-                            accept = false;
+                        if (auto skip_exp =
+                                skip_bytes(file, file_size, len - nread);
+                            !skip_exp) {
+                            return std::unexpected(skip_exp.error());
                         }
                     } else {
                         if (auto skip_exp = skip_bytes(file, file_size, len);
@@ -508,7 +491,6 @@ index_j2k_essence_frames(const std::string& path,
                 }
             }
 
-            // Default: skip value.
             if (auto skip_exp = skip_bytes(file, file_size, len); !skip_exp) {
                 return std::unexpected(skip_exp.error());
             }
@@ -522,9 +504,6 @@ index_j2k_essence_frames(const std::string& path,
 
 static std::expected<std::vector<uint8_t>, std::string>
 read_at(MXFFile* file, uint64_t offset, uint32_t size) {
-    if (file == nullptr) {
-        return std::unexpected("Null MXF file handle");
-    }
     if (size == 0) {
         return std::unexpected("Zero-sized essence frame");
     }
@@ -563,8 +542,7 @@ probe_j2k_header(std::span<uint8_t> buf) {
             "Essence does not look like a JPEG 2000 codestream (missing SOC)");
     }
 
-    // Grok API expects mutable pointers, but should not mutate the input buffer.
-    grk_initialize(nullptr, 0, nullptr);
+    grok_init_once();
 
     grk_stream_params sp{};
     sp.buf = buf.data();
@@ -621,7 +599,6 @@ static inline uint16_t convert_sample_to_u12(int32_t v, uint8_t prec_in,
     int64_t vv = v;
     if (signed_in) {
         if (prec_in >= PRECISION_LIMIT_BITS) {
-            // Not expected for JPEG 2000 picture essence.
             vv = std::clamp<int64_t>(vv, 0, static_cast<int64_t>(OUT_MAX));
             return static_cast<uint16_t>(vv);
         }
@@ -638,14 +615,16 @@ static inline uint16_t convert_sample_to_u12(int32_t v, uint8_t prec_in,
         u = std::min(u, in_max);
     }
 
-    auto out = u;
+    uint64_t out = u;
     if (prec_in > OUT_BITS) {
-        out >>= (prec_in - OUT_BITS);
+        const auto shift = static_cast<uint8_t>(prec_in - OUT_BITS);
+        out = (shift >= 64) ? 0 : (out >> shift);
     } else if (prec_in < OUT_BITS) {
-        out <<= (OUT_BITS - prec_in);
+        const auto shift = static_cast<uint8_t>(OUT_BITS - prec_in);
+        out = (shift >= 64) ? 0 : (out << shift);
     }
 
-    out = std::min(out, OUT_MAX);
+    out = std::min<uint64_t>(out, OUT_MAX);
 
     return static_cast<uint16_t>(out);
 }
@@ -705,7 +684,7 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         }
         std::vector<uint8_t> frame_buf = std::move(*frame_buf_exp);
 
-        grk_initialize(nullptr, 0, nullptr);
+        grok_init_once();
 
         grk_stream_params sp{};
         sp.buf = frame_buf.data();
@@ -763,9 +742,6 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         const grk_image_comp* c2 = (ncomps >= 3) ? &comps[2] : c0;
 
         auto validate_comp = [&](const grk_image_comp* c) {
-            if (!c) {
-                throw std::runtime_error("grok: null component");
-            }
             if (c->data_type != GRK_INT_32) {
                 throw std::runtime_error(
                     "grok: unsupported component data type (expected int32)");
@@ -844,147 +820,126 @@ static void VS_CC mxfj2k_free(void* instance_data, VSCore* /*unused*/,
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
                                 VSCore* core, const VSAPI* vsapi) {
-    int err = 0;
-    const char* src = vsapi->mapGetData(in, "source", 0, &err);
-    if ((err != 0) || (src == nullptr) || (*src == '\0')) {
-        vsapi->mapSetError(out, "MXFJ2KSource.Source: 'source' is required");
-        return;
-    }
-
-    const int64_t forced_track = vsapi->mapGetInt(in, "track", 0, &err);
-    const std::optional<uint32_t> forced_track_number =
-        ((err == 0) && forced_track > 0)
-            ? std::optional<uint32_t>(static_cast<uint32_t>(forced_track))
-            : std::nullopt;
-
-    VideoTrackInfo track_info{};
-    if (auto track_info_exp = probe_mxf_video_track(src); track_info_exp) {
-        track_info = *track_info_exp;
-    } else {
-        // We can still index by sniffing SOC markers and assume 24 fps.
-        if (!track_info_exp.error().empty()) {
-            vsapi->logMessage(
-                mtWarning,
-                (std::string("MXFJ2KSource: ") + track_info_exp.error())
-                    .c_str(),
-                core);
+    try {
+        int err = 0;
+        const char* src = vsapi->mapGetData(in, "source", 0, &err);
+        if ((err != 0) || (src == nullptr) || (*src == '\0')) {
+            vsapi->mapSetError(out, "Source: 'source' is required");
+            return;
         }
-    }
 
-    if (forced_track_number) {
-        track_info.track_number = forced_track_number;
-    }
+        const int64_t forced_track = vsapi->mapGetInt(in, "track", 0, &err);
+        const std::optional<uint32_t> forced_track_number =
+            ((err == 0) && forced_track > 0)
+                ? std::optional<uint32_t>(static_cast<uint32_t>(forced_track))
+                : std::nullopt;
 
-    auto frames_exp = index_j2k_essence_frames(src, track_info.track_number);
-    if (!frames_exp || frames_exp->empty()) {
-        // If track-number-based indexing failed, retry without track filtering.
-        if (track_info.track_number) {
-            auto retry = index_j2k_essence_frames(src, std::nullopt);
-            if (retry && !retry->empty()) {
-                frames_exp = std::move(retry);
+        VideoTrackInfo track_info{};
+        if (auto track_info_exp = probe_mxf_video_track(src); track_info_exp) {
+            track_info = *track_info_exp;
+        } else {
+            if (!track_info_exp.error().empty()) {
+                vsapi->logMessage(
+                    mtWarning,
+                    (std::string("MXFJ2KSource: ") + track_info_exp.error())
+                        .c_str(),
+                    core);
             }
         }
-    }
 
-    if (!frames_exp || frames_exp->empty()) {
-        const std::string why = frames_exp ? "No JPEG 2000 essence frames found"
-                                           : frames_exp.error();
-        vsapi->mapSetError(
-            out, (std::string("MXFJ2KSource.Source: ") + why).c_str());
-        return;
-    }
+        if (forced_track_number) {
+            track_info.track_number = forced_track_number;
+        }
 
-    // Read first frame and probe JPEG 2000 header for dimensions.
-    std::vector<uint8_t> first_frame;
-    try {
-        MxfDiskFile f(src);
-        auto first_exp = read_at(f.get(), frames_exp->front().value_offset,
+        auto frames_exp =
+            index_j2k_essence_frames(src, track_info.track_number);
+        if (!frames_exp || frames_exp->empty()) {
+            if (track_info.track_number) {
+                auto retry = index_j2k_essence_frames(src, std::nullopt);
+                if (retry && !retry->empty()) {
+                    frames_exp = std::move(retry);
+                }
+            }
+        }
+
+        if (!frames_exp || frames_exp->empty()) {
+            const std::string why = frames_exp
+                                        ? "No JPEG 2000 essence frames found"
+                                        : frames_exp.error();
+            vsapi->mapSetError(out, (std::string("Source: ") + why).c_str());
+            return;
+        }
+
+        MxfDiskFile file(src);
+        auto first_exp = read_at(file.get(), frames_exp->front().value_offset,
                                  frames_exp->front().value_size);
         if (!first_exp) {
             vsapi->mapSetError(
-                out, (std::string("MXFJ2KSource.Source: ") + first_exp.error())
-                         .c_str());
+                out, (std::string("Source: ") + first_exp.error()).c_str());
             return;
         }
-        first_frame = std::move(*first_exp);
-    } catch (const std::exception& e) {
-        vsapi->mapSetError(
-            out, (std::string("MXFJ2KSource.Source: ") + e.what()).c_str());
-        return;
-    }
+        std::vector<uint8_t> first_frame = std::move(*first_exp);
 
-    auto hdr_exp = probe_j2k_header(
-        std::span<uint8_t>(first_frame.data(), first_frame.size()));
-    if (!hdr_exp && track_info.track_number) {
-        // TrackNumber mismatch (or non-picture essence). Retry indexing by sniffing
-        // codestream prefix.
-        auto retry_frames = index_j2k_essence_frames(src, std::nullopt);
-        if (retry_frames && !retry_frames->empty()) {
-            try {
-                MxfDiskFile f(src);
+        auto hdr_exp = probe_j2k_header(
+            std::span<uint8_t>(first_frame.data(), first_frame.size()));
+        if (!hdr_exp && track_info.track_number) {
+            auto retry_frames = index_j2k_essence_frames(src, std::nullopt);
+            if (retry_frames && !retry_frames->empty()) {
                 auto retry_first =
-                    read_at(f.get(), retry_frames->front().value_offset,
+                    read_at(file.get(), retry_frames->front().value_offset,
                             retry_frames->front().value_size);
                 if (retry_first) {
                     first_frame = std::move(*retry_first);
                     auto retry_hdr = probe_j2k_header(std::span<uint8_t>(
                         first_frame.data(), first_frame.size()));
                     if (retry_hdr) {
-                        vsapi->logMessage(mtWarning,
-                                          "MXFJ2KSource: MXF track metadata "
-                                          "didn't match J2K essence; "
-                                          "falling back to sniffed J2K KLVs",
-                                          core);
+                        vsapi->logMessage(
+                            mtWarning,
+                            "MXFJ2KSource: MXF track metadata didn't match "
+                            "J2K essence; falling back to sniffed J2K KLVs",
+                            core);
                         hdr_exp = std::move(retry_hdr);
                         frames_exp = std::move(retry_frames);
                     }
                 }
-            } catch (...) {
             }
         }
-    }
-    if (!hdr_exp) {
-        vsapi->mapSetError(
-            out,
-            (std::string("MXFJ2KSource.Source: ") + hdr_exp.error()).c_str());
-        return;
-    }
-    const J2KHeaderInfo hdr = *hdr_exp;
+        if (!hdr_exp) {
+            vsapi->mapSetError(
+                out, (std::string("Source: ") + hdr_exp.error()).c_str());
+            return;
+        }
+        const J2KHeaderInfo hdr = *hdr_exp;
 
-    if (hdr.width <= 0 || hdr.height <= 0) {
-        vsapi->mapSetError(out,
-                           "MXFJ2KSource.Source: invalid JPEG 2000 dimensions");
-        return;
-    }
+        VSVideoFormat fmt{};
+        if (vsapi->queryVideoFormat(&fmt, cfRGB, stInteger,
+                                    VAPOURSYNTH_RGB36_BITS, 0, 0, core) == 0) {
+            vsapi->mapSetError(
+                out, "Source: VapourSynth core does not support RGB36");
+            return;
+        }
 
-    VSVideoFormat fmt{};
-    if (vsapi->queryVideoFormat(&fmt, cfRGB, stInteger, VAPOURSYNTH_RGB36_BITS,
-                                0, 0, core) == 0) {
-        vsapi->mapSetError(
-            out,
-            "MXFJ2KSource.Source: VapourSynth core does not support RGB36");
-        return;
-    }
+        auto d = std::make_unique<MXFJ2KSourceData>();
+        d->path = src;
+        d->frames = std::move(*frames_exp);
+        d->vi.format = fmt;
+        d->vi.width = hdr.width;
+        d->vi.height = hdr.height;
+        d->vi.numFrames =
+            vsh::int64ToIntS(static_cast<int64_t>(d->frames.size()));
+        d->vi.fpsNum = track_info.fps_num;
+        d->vi.fpsDen = track_info.fps_den;
+        vsh::reduceRational(&d->vi.fpsNum, &d->vi.fpsDen);
 
-    auto d = std::make_unique<MXFJ2KSourceData>();
-    d->path = src;
-    d->frames = std::move(*frames_exp);
-    d->vi.format = fmt;
-    d->vi.width = hdr.width;
-    d->vi.height = hdr.height;
-    d->vi.numFrames = vsh::int64ToIntS(static_cast<int64_t>(d->frames.size()));
-    d->vi.fpsNum = track_info.fps_num;
-    d->vi.fpsDen = track_info.fps_den;
-    if (d->vi.fpsNum <= 0 || d->vi.fpsDen <= 0) {
-        d->vi.fpsNum = DEFAULT_FPS_NUM;
-        d->vi.fpsDen = DEFAULT_FPS_DEN;
+        vsapi->createVideoFilter(out, "MXFJ2KSource.Source", &d->vi,
+                                 mxfj2k_get_frame, mxfj2k_free, fmUnordered,
+                                 nullptr, 0, d.get(), core);
+        (void)d.release();
+    } catch (const std::exception& e) {
+        vsapi->mapSetError(out, (std::string("Source: ") + e.what()).c_str());
+    } catch (...) {
+        vsapi->mapSetError(out, "Source: unknown error");
     }
-    vsh::reduceRational(&d->vi.fpsNum, &d->vi.fpsDen);
-
-    vsapi->createVideoFilter(out, "MXFJ2KSource.Source", &d->vi,
-                             mxfj2k_get_frame, mxfj2k_free, fmUnordered,
-                             nullptr, 0, d.get(), core);
-    (void)d.release();
 }
 
 } // namespace mxfj2ksource
