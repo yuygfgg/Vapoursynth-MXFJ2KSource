@@ -51,11 +51,7 @@ def xyz2rgb(
     expr_g = common_expr + f"RESULT = G_lin ** (1.0 / {gamma});"
     expr_b = common_expr + f"RESULT = B_lin ** (1.0 / {gamma});"
 
-    mapped_r = expr_func(
-        clips=[X_plane, Y_plane, Z_plane],
-        expr=[expr_r],
-        infix=1,
-    )
+    mapped_r = expr_func(clips=[X_plane, Y_plane, Z_plane], expr=[expr_r], infix=1)
     mapped_g = expr_func(clips=[X_plane, Y_plane, Z_plane], expr=[expr_g], infix=1)
     mapped_b = expr_func(clips=[X_plane, Y_plane, Z_plane], expr=[expr_b], infix=1)
 
