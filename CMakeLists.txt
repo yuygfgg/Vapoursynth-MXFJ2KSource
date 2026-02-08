@@ -8,6 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(MXFJ2K_PREFER_STATIC "Prefer static libraries for dependencies when possible" ON)
+option(USE_LTO "Enable link time optimization" ON)
+
 if(MXFJ2K_PREFER_STATIC)
     set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 
@@ -26,6 +28,11 @@ if(MXFJ2K_PREFER_STATIC)
             set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "")
         endif()
     endif()
+endif()
+
+cmake_policy(SET CMP0069 NEW)
+if(USE_LTO)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
 
 # libMXF/libMXFpp as in-repo dependencies.

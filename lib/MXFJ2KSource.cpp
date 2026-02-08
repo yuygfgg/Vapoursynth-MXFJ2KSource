@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <expected>
+#include <format>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -214,10 +215,10 @@ probe_mxf_video_track(const std::string& path) {
 
         return info;
     } catch (const MXFException& e) {
-        return std::unexpected(std::string("libMXFpp error: ") +
-                               e.getMessage());
+        return std::unexpected(
+            std::format("libMXFpp error: {}", e.getMessage()));
     } catch (const std::exception& e) {
-        return std::unexpected(std::string("Error: ") + e.what());
+        return std::unexpected(std::format("Error: {}", e.what()));
     }
 }
 
@@ -498,7 +499,7 @@ index_j2k_essence_frames(const std::string& path,
 
         return frames;
     } catch (const std::exception& e) {
-        return std::unexpected(std::string("Indexing error: ") + e.what());
+        return std::unexpected(std::format("Indexing error: {}", e.what()));
     }
 }
 
@@ -804,8 +805,8 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
 
         return dst.release();
     } catch (const std::exception& e) {
-        vsapi->setFilterError(
-            (std::string("MXFJ2KSource: ") + e.what()).c_str(), frame_ctx);
+        const std::string msg = std::format("MXFJ2KSource: {}", e.what());
+        vsapi->setFilterError(msg.c_str(), frame_ctx);
         return nullptr;
     }
 }
@@ -833,17 +834,16 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
             ((err == 0) && forced_track > 0)
                 ? std::optional<uint32_t>(static_cast<uint32_t>(forced_track))
                 : std::nullopt;
+        const bool track_forced = forced_track_number.has_value();
 
         VideoTrackInfo track_info{};
         if (auto track_info_exp = probe_mxf_video_track(src); track_info_exp) {
             track_info = *track_info_exp;
         } else {
             if (!track_info_exp.error().empty()) {
-                vsapi->logMessage(
-                    mtWarning,
-                    (std::string("MXFJ2KSource: ") + track_info_exp.error())
-                        .c_str(),
-                    core);
+                const std::string msg =
+                    std::format("MXFJ2KSource: {}", track_info_exp.error());
+                vsapi->logMessage(mtWarning, msg.c_str(), core);
             }
         }
 
@@ -855,18 +855,27 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
             index_j2k_essence_frames(src, track_info.track_number);
         if (!frames_exp || frames_exp->empty()) {
             if (track_info.track_number) {
-                auto retry = index_j2k_essence_frames(src, std::nullopt);
-                if (retry && !retry->empty()) {
-                    frames_exp = std::move(retry);
+                if (!track_forced) {
+                    auto retry = index_j2k_essence_frames(src, std::nullopt);
+                    if (retry && !retry->empty()) {
+                        frames_exp = std::move(retry);
+                    }
                 }
             }
         }
 
         if (!frames_exp || frames_exp->empty()) {
-            const std::string why = frames_exp
-                                        ? "No JPEG 2000 essence frames found"
-                                        : frames_exp.error();
-            vsapi->mapSetError(out, (std::string("Source: ") + why).c_str());
+            std::string why;
+            if (!frames_exp) {
+                why = frames_exp.error();
+            } else if (track_forced) {
+                why = std::format("Requested track {} not found",
+                                  *forced_track_number);
+            } else {
+                why = "No JPEG 2000 essence frames found";
+            }
+            const std::string msg = std::format("Source: {}", why);
+            vsapi->mapSetError(out, msg.c_str());
             return;
         }
 
@@ -874,8 +883,9 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         auto first_exp = read_at(file.get(), frames_exp->front().value_offset,
                                  frames_exp->front().value_size);
         if (!first_exp) {
-            vsapi->mapSetError(
-                out, (std::string("Source: ") + first_exp.error()).c_str());
+            const std::string msg =
+                std::format("Source: {}", first_exp.error());
+            vsapi->mapSetError(out, msg.c_str());
             return;
         }
         std::vector<uint8_t> first_frame = std::move(*first_exp);
@@ -883,30 +893,37 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         auto hdr_exp = probe_j2k_header(
             std::span<uint8_t>(first_frame.data(), first_frame.size()));
         if (!hdr_exp && track_info.track_number) {
-            auto retry_frames = index_j2k_essence_frames(src, std::nullopt);
-            if (retry_frames && !retry_frames->empty()) {
-                auto retry_first =
-                    read_at(file.get(), retry_frames->front().value_offset,
-                            retry_frames->front().value_size);
-                if (retry_first) {
-                    first_frame = std::move(*retry_first);
-                    auto retry_hdr = probe_j2k_header(std::span<uint8_t>(
-                        first_frame.data(), first_frame.size()));
-                    if (retry_hdr) {
-                        vsapi->logMessage(
-                            mtWarning,
-                            "MXFJ2KSource: MXF track metadata didn't match "
-                            "J2K essence; falling back to sniffed J2K KLVs",
-                            core);
-                        hdr_exp = std::move(retry_hdr);
-                        frames_exp = std::move(retry_frames);
+            if (!track_forced) {
+                auto retry_frames = index_j2k_essence_frames(src, std::nullopt);
+                if (retry_frames && !retry_frames->empty()) {
+                    auto retry_first =
+                        read_at(file.get(), retry_frames->front().value_offset,
+                                retry_frames->front().value_size);
+                    if (retry_first) {
+                        first_frame = std::move(*retry_first);
+                        auto retry_hdr = probe_j2k_header(std::span<uint8_t>(
+                            first_frame.data(), first_frame.size()));
+                        if (retry_hdr) {
+                            vsapi->logMessage(
+                                mtWarning,
+                                "MXFJ2KSource: MXF track metadata didn't match "
+                                "J2K essence; falling back to sniffed J2K KLVs",
+                                core);
+                            hdr_exp = std::move(retry_hdr);
+                            frames_exp = std::move(retry_frames);
+                        }
                     }
                 }
             }
         }
         if (!hdr_exp) {
-            vsapi->mapSetError(
-                out, (std::string("Source: ") + hdr_exp.error()).c_str());
+            std::string why = hdr_exp.error();
+            if (track_forced) {
+                why = std::format("Requested track {} is not JPEG 2000: {}",
+                                  *forced_track_number, why);
+            }
+            const std::string msg = std::format("Source: {}", why);
+            vsapi->mapSetError(out, msg.c_str());
             return;
         }
         const J2KHeaderInfo hdr = *hdr_exp;
@@ -936,7 +953,8 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
                                  nullptr, 0, d.get(), core);
         (void)d.release();
     } catch (const std::exception& e) {
-        vsapi->mapSetError(out, (std::string("Source: ") + e.what()).c_str());
+        const std::string msg = std::format("Source: {}", e.what());
+        vsapi->mapSetError(out, msg.c_str());
     } catch (...) {
         vsapi->mapSetError(out, "Source: unknown error");
     }
