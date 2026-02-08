@@ -1,0 +1,127 @@
+name: windows-x64-static
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    env:
+      GROK_REF: v20.0.5
+      GROK_PREFIX_DIR: grok-prefix
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 (MINGW64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-vapoursynth
+
+      - name: Restore Grok cache
+        id: cache-grok
+        uses: actions/cache/restore@v4
+        with:
+          path: grok-prefix
+          key: grok-${{ runner.os }}-${{ env.GROK_REF }}-mingw64-${{ hashFiles('.github/workflows/windows-static.yml') }}
+
+      - name: Build Grok (static)
+        if: steps.cache-grok.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          prefix="$PWD/$GROK_PREFIX_DIR"
+
+          git clone --depth 1 --branch "$GROK_REF" --recursive \
+            https://github.com/GrokImageCompression/grok.git grok-src
+
+          cmake -S grok-src -B grok-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DBUILD_TESTING=OFF \
+            -DGRK_BUILD_PKGCONFIG_FILES=ON \
+            -DGRK_BUNDLE_STATIC_CORE=ON \
+            -DGRK_BUILD_CORE_EXAMPLES=OFF \
+            -DGRK_BUILD_CODEC_EXAMPLES=OFF \
+            -DGRK_ENABLE_EXIFTOOL=OFF \
+            -DGRK_BUILD_LIBPNG=OFF \
+            -DGRK_BUILD_LIBTIFF=OFF \
+            -DGRK_BUILD_JPEG=OFF \
+            -DCMAKE_INSTALL_PREFIX="$prefix"
+
+          cmake --build grok-build --parallel --target grokj2kcodec bundling_target
+          cmake --install grok-build --component Libraries
+          cmake --install grok-build --component Headers
+          cmake --install grok-build --component Unspecified
+
+      - name: Save Grok cache
+        if: steps.cache-grok.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: grok-prefix
+          key: grok-${{ runner.os }}-${{ env.GROK_REF }}-mingw64-${{ hashFiles('.github/workflows/windows-static.yml') }}
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+
+          prefix="$PWD/$GROK_PREFIX_DIR"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMXFJ2K_PREFER_STATIC=ON
+
+      - name: Build
+        run: |
+          set -euo pipefail
+
+          prefix="$PWD/$GROK_PREFIX_DIR"
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig:$prefix/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+          cmake --build build --parallel
+
+      - name: Verify DLL dependencies
+        run: |
+          set -euo pipefail
+
+          dll="build/libMXFJ2KSource.dll"
+          test -f "$dll"
+
+          deps="$(objdump -p "$dll" | awk '/DLL Name:/ {print $3}')"
+          echo "$deps"
+
+          if echo "$deps" | grep -qiE '^(lib.+|zlib1|iconv-2|charset-1)\.dll$'; then
+            echo "Unexpected non-system DLL dependency detected"
+            exit 1
+          fi
+
+          for bad in libgrokj2kcodec libgrokj2k libstdc++-6 libgcc_s_seh-1 libwinpthread-1; do
+            if echo "$deps" | grep -qi "$bad"; then
+              echo "Unexpected dynamic dependency: $bad"
+              exit 1
+            fi
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libMXFJ2KSource-windows-x64-static
+          path: build/libMXFJ2KSource.dll
+          if-no-files-found: error

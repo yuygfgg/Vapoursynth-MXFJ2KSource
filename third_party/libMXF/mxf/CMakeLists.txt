@@ -64,12 +64,19 @@ set(MXF_headers
 if(WIN32)
     list(APPEND MXF_sources
         mxf_win32_file.c
-        mxf_win32_mmap.c
     )
     list(APPEND MXF_headers
         mxf_win32_file.h
-        mxf_win32_mmap.h
     )
+
+    if(MSVC)
+        list(APPEND MXF_sources
+            mxf_win32_mmap.c
+        )
+        list(APPEND MXF_headers
+            mxf_win32_mmap.h
+        )
+    endif()
 endif()
 
 add_library(MXF ${MXF_sources})

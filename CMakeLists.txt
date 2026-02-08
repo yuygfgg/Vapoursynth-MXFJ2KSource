@@ -61,3 +61,20 @@ target_link_libraries(MXFJ2KSource PRIVATE
     MXFpp
     PkgConfig::GROK
 )
+
+if(MXFJ2K_PREFER_STATIC AND WIN32)
+    target_compile_definitions(MXFJ2KSource PRIVATE GRK_STATIC)
+endif()
+
+if(MXFJ2K_PREFER_STATIC AND MINGW)
+    target_link_options(MXFJ2KSource PRIVATE
+        -static-libgcc
+        -static-libstdc++
+    )
+
+    target_link_libraries(MXFJ2KSource PRIVATE
+        -Wl,--whole-archive
+        -l:libwinpthread.a
+        -Wl,--no-whole-archive
+    )
+endif()
