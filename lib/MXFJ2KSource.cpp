@@ -40,12 +40,9 @@ namespace mxfj2ksource {
 namespace fs = std::filesystem;
 
 static fs::path path_from_utf8(std::string_view s) {
-    std::u8string u8;
-    u8.reserve(s.size());
-    for (unsigned char ch : s) {
-        u8.push_back(static_cast<char8_t>(ch));
-    }
-    return fs::path(u8);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    return {(std::u8string_view(reinterpret_cast<const char8_t*>(s.data()),
+                                s.size()))};
 }
 
 static constexpr int DEFAULT_FPS_NUM = 24;
@@ -74,7 +71,7 @@ static constexpr uint8_t PARTITION_LABEL_REGVER_1 = 0x01;
 static constexpr uint8_t PARTITION_LABEL_REGVER_2 = 0x02;
 
 static constexpr int VAPOURSYNTH_RGB36_BITS = 12;
-static constexpr uint8_t PRECISION_LIMIT_BITS = 32;
+static constexpr int VAPOURSYNTH_RGB48_BITS = 16;
 static constexpr size_t FRAME_INDEX_RESERVE = 4096;
 
 static void grok_init_once() {
@@ -100,6 +97,8 @@ struct J2KHeaderInfo {
     int height = 0;
     uint8_t prec = 0;
     uint16_t num_comps = 0;
+    bool first_three_full_res = false; // "4:4:4" / full-res for 3-comp images
+    bool first_three_same_prec = false;
 };
 
 class MxfDiskFile final {
@@ -120,21 +119,44 @@ class MxfDiskFile final {
     MxfDiskFile& operator=(const MxfDiskFile&) = delete;
 
     MxfDiskFile(MxfDiskFile&& other) noexcept
-        : file(std::exchange(other.file, nullptr)) {}
+        : file(std::exchange(other.file, nullptr)),
+          scratch(std::move(other.scratch)),
+          scratch_capacity(std::exchange(other.scratch_capacity, 0)),
+          scratch_size(std::exchange(other.scratch_size, 0)) {}
     MxfDiskFile& operator=(MxfDiskFile&& other) noexcept {
         if (this != &other) {
             if (file != nullptr) {
                 mxf_file_close(&file);
             }
             file = std::exchange(other.file, nullptr);
+            scratch = std::move(other.scratch);
+            scratch_capacity = std::exchange(other.scratch_capacity, 0);
+            scratch_size = std::exchange(other.scratch_size, 0);
         }
         return *this;
     }
 
     [[nodiscard]] MXFFile* get() const { return file; }
 
+    [[nodiscard]] std::span<uint8_t> scratchBuf(size_t size) {
+        if (size == 0) {
+            scratch_size = 0;
+            return {};
+        }
+        if (scratch_capacity < size) {
+            scratch = std::make_unique_for_overwrite<uint8_t[]>(size);
+            scratch_capacity = size;
+        }
+        scratch_size = size;
+        return {scratch.get(), scratch_size};
+    }
+
   private:
     MXFFile* file = nullptr;
+
+    std::unique_ptr<uint8_t[]> scratch;
+    size_t scratch_capacity = 0;
+    size_t scratch_size = 0;
 };
 
 struct GrokCodecDeleter {
@@ -147,7 +169,7 @@ struct GrokCodecDeleter {
 };
 using GrokCodecPtr = std::unique_ptr<grk_object, GrokCodecDeleter>;
 
-static std::expected<VideoTrackInfo, std::string>
+[[nodiscard]] static std::expected<VideoTrackInfo, std::string>
 probe_mxf_video_track(const std::string& path) {
     using namespace mxfpp;
 
@@ -251,7 +273,7 @@ struct KLVHeader {
     uint64_t value_start = 0; // file offset of payload start
 };
 
-static std::expected<void, std::string>
+[[nodiscard]] static std::expected<void, std::string>
 skip_bytes(MXFFile* file, int64_t file_size, uint64_t len) {
     if (len == 0) {
         return {};
@@ -281,7 +303,7 @@ skip_bytes(MXFFile* file, int64_t file_size, uint64_t len) {
     return {};
 }
 
-static std::expected<std::optional<KLVHeader>, std::string>
+[[nodiscard]] static std::expected<std::optional<KLVHeader>, std::string>
 read_klv_header(MXFFile* file, int64_t file_size) {
     const int64_t pos = mxf_file_tell(file);
     if (pos < 0) {
@@ -362,7 +384,7 @@ read_klv_header(MXFFile* file, int64_t file_size) {
     return h;
 }
 
-static std::expected<std::optional<KLVHeader>, std::string>
+[[nodiscard]] static std::expected<std::optional<KLVHeader>, std::string>
 read_next_nonfiller_klv_header(MXFFile* file, int64_t file_size) {
     while (true) {
         auto hdr_exp = read_klv_header(file, file_size);
@@ -384,7 +406,7 @@ read_next_nonfiller_klv_header(MXFFile* file, int64_t file_size) {
     }
 }
 
-static std::expected<uint16_t, std::string>
+[[nodiscard]] static std::expected<uint16_t, std::string>
 detect_and_set_runin_len(MXFFile* file) {
     if (mxf_file_seek(file, 0, SEEK_SET) == 0) {
         return std::unexpected("mxf_file_seek failed");
@@ -582,7 +604,7 @@ try_read_index_cache_file(const fs::path& cache_path) {
     return cache;
 }
 
-static std::expected<void, std::string>
+[[nodiscard]] static std::expected<void, std::string>
 write_index_cache_file(const fs::path& cache_path,
                        const IndexCacheFile& cache) {
     std::error_code ec;
@@ -651,7 +673,7 @@ write_index_cache_file(const fs::path& cache_path,
     return {};
 }
 
-static std::expected<std::vector<FrameIndex>, std::string>
+[[nodiscard]] static std::expected<std::vector<FrameIndex>, std::string>
 index_j2k_essence_frames_scan(
     const std::string& path,
     const std::optional<uint32_t> desired_track_number) {
@@ -740,7 +762,7 @@ index_j2k_essence_frames_scan(
     }
 }
 
-static std::expected<std::vector<FrameIndex>, std::string>
+[[nodiscard]] static std::expected<std::vector<FrameIndex>, std::string>
 index_j2k_essence_frames(const std::string& path,
                          const std::optional<uint32_t> desired_track_number,
                          const std::optional<fs::path>& cache_path,
@@ -749,18 +771,19 @@ index_j2k_essence_frames(const std::string& path,
     const fs::path src_fs = path_from_utf8(path);
     const std::optional<FileStamp> stamp = try_get_file_stamp(src_fs);
 
+    std::optional<IndexCacheFile> existing_cache;
     if (cache_path && stamp) {
         try {
-            if (auto cache = try_read_index_cache_file(*cache_path);
-                cache && cache->src_stamp == *stamp) {
-                for (const IndexCacheEntry& e : cache->entries) {
+            existing_cache = try_read_index_cache_file(*cache_path);
+            if (existing_cache && existing_cache->src_stamp == *stamp) {
+                for (const IndexCacheEntry& e : existing_cache->entries) {
                     if (e.desired_track_number == desired_track_number) {
                         return e.frames;
                     }
                 }
             }
         } catch (...) {
-            // Ignore cache read failures and fall back to indexing.
+            existing_cache.reset();
         }
     }
 
@@ -773,9 +796,8 @@ index_j2k_essence_frames(const std::string& path,
         try {
             IndexCacheFile cache{};
             cache.src_stamp = *stamp;
-            if (auto existing = try_read_index_cache_file(*cache_path);
-                existing && existing->src_stamp == *stamp) {
-                cache = std::move(*existing);
+            if (existing_cache && existing_cache->src_stamp == *stamp) {
+                cache = std::move(*existing_cache);
             }
 
             bool updated = false;
@@ -826,9 +848,9 @@ index_j2k_essence_frames(const std::string& path,
     return frames_exp;
 }
 
-static std::expected<std::vector<uint8_t>, std::string>
-read_at(MXFFile* file, uint64_t offset, uint32_t size) {
-    if (size == 0) {
+[[nodiscard]] static std::expected<void, std::string>
+read_at(MXFFile* file, uint64_t offset, std::span<uint8_t> buf) {
+    if (buf.empty()) {
         return std::unexpected("Zero-sized essence frame");
     }
 
@@ -836,17 +858,19 @@ read_at(MXFFile* file, uint64_t offset, uint32_t size) {
         return std::unexpected("Essence offset out of range");
     }
 
+    if (buf.size() > std::numeric_limits<uint32_t>::max()) {
+        return std::unexpected("Essence frame too large");
+    }
+    const auto size = static_cast<uint32_t>(buf.size());
+
     if (mxf_file_seek(file, static_cast<int64_t>(offset), SEEK_SET) == 0) {
         return std::unexpected("mxf_file_seek failed");
     }
 
-    std::vector<uint8_t> buf(size);
     uint32_t got = 0;
     while (got < size) {
-        std::span<uint8_t> remaining(buf);
-        remaining = remaining.subspan(static_cast<size_t>(got));
-        const uint32_t n = mxf_file_read(
-            file, remaining.data(), static_cast<uint32_t>(remaining.size()));
+        const uint32_t n = mxf_file_read(file, buf.data() + got,
+                                         static_cast<uint32_t>(size - got));
         if (n == 0) {
             break;
         }
@@ -856,10 +880,10 @@ read_at(MXFFile* file, uint64_t offset, uint32_t size) {
         return std::unexpected("Short read while reading essence frame");
     }
 
-    return buf;
+    return {};
 }
 
-static std::expected<J2KHeaderInfo, std::string>
+[[nodiscard]] static std::expected<J2KHeaderInfo, std::string>
 probe_j2k_header(std::span<uint8_t> buf) {
     if (!looks_like_j2k_codestream_prefix(buf)) {
         return std::unexpected(
@@ -909,49 +933,74 @@ probe_j2k_header(std::span<uint8_t> buf) {
     info.height = h;
     info.num_comps = img->numcomps;
     info.prec = comps.front().prec;
+    if (info.num_comps >= 3) {
+        info.first_three_full_res = true;
+        info.first_three_same_prec = true;
+
+        const uint8_t p0 = comps[0].prec;
+        for (size_t i = 0; i < 3; ++i) {
+            if (comps[i].prec != p0) {
+                info.first_three_same_prec = false;
+            }
+            if (!std::cmp_equal(comps[i].w, w) ||
+                !std::cmp_equal(comps[i].h, h)) {
+                info.first_three_full_res = false;
+            }
+        }
+    }
     return info;
 }
 
-static inline uint16_t convert_sample_to_u12(int32_t v, uint8_t prec_in,
-                                             bool signed_in) {
-    static constexpr uint8_t OUT_BITS = 12;
-    static constexpr uint32_t OUT_MAX = (1U << OUT_BITS) - 1U;
+static inline void copy_plane_to_u12(int w, int h, const int32_t* src,
+                                     uint32_t src_stride_samples, uint8_t* dstp,
+                                     ptrdiff_t dst_stride_bytes,
+                                     bool signed_in) {
+    static constexpr int64_t OUT_MAX =
+        (int64_t{1} << VAPOURSYNTH_RGB36_BITS) - 1;
+    const int64_t offset =
+        signed_in ? (int64_t{1} << (VAPOURSYNTH_RGB36_BITS - 1)) : 0;
 
-    if (prec_in == 0) {
-        return 0;
-    }
-
-    int64_t vv = v;
-    if (signed_in) {
-        if (prec_in >= PRECISION_LIMIT_BITS) {
-            vv = std::clamp<int64_t>(vv, 0, static_cast<int64_t>(OUT_MAX));
-            return static_cast<uint16_t>(vv);
+    for (int y = 0; y < h; ++y) {
+        const auto* src_row = src + static_cast<size_t>(y) *
+                                        static_cast<size_t>(src_stride_samples);
+        auto* dst_row =
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            reinterpret_cast<uint16_t*>(
+                dstp +
+                static_cast<size_t>(y) * static_cast<size_t>(dst_stride_bytes));
+        for (int x = 0; x < w; ++x) {
+            const int64_t vv =
+                static_cast<int64_t>(src_row[static_cast<size_t>(x)]) + offset;
+            dst_row[static_cast<size_t>(x)] =
+                static_cast<uint16_t>(std::clamp<int64_t>(vv, 0, OUT_MAX));
         }
-        vv += (int64_t{1} << (prec_in - 1));
     }
+}
 
-    vv = std::max<int64_t>(vv, 0);
+static inline void copy_plane_to_u16(int w, int h, const int32_t* src,
+                                     uint32_t src_stride_samples, uint8_t* dstp,
+                                     ptrdiff_t dst_stride_bytes,
+                                     bool signed_in) {
+    static constexpr int64_t OUT_MAX =
+        (int64_t{1} << VAPOURSYNTH_RGB48_BITS) - 1;
+    const int64_t offset =
+        signed_in ? (int64_t{1} << (VAPOURSYNTH_RGB48_BITS - 1)) : 0;
 
-    auto u = static_cast<uint32_t>(
-        std::min<int64_t>(vv, std::numeric_limits<uint32_t>::max()));
-
-    if (prec_in < PRECISION_LIMIT_BITS) {
-        const uint32_t in_max = (uint32_t{1} << prec_in) - 1U;
-        u = std::min(u, in_max);
+    for (int y = 0; y < h; ++y) {
+        const auto* src_row = src + (static_cast<size_t>(y) *
+                                     static_cast<size_t>(src_stride_samples));
+        auto* dst_row =
+            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+            reinterpret_cast<uint16_t*>(
+                dstp + (static_cast<size_t>(y) *
+                        static_cast<size_t>(dst_stride_bytes)));
+        for (int x = 0; x < w; ++x) {
+            const int64_t vv =
+                static_cast<int64_t>(src_row[static_cast<size_t>(x)]) + offset;
+            dst_row[static_cast<size_t>(x)] =
+                static_cast<uint16_t>(std::clamp<int64_t>(vv, 0, OUT_MAX));
+        }
     }
-
-    uint64_t out = u;
-    if (prec_in > OUT_BITS) {
-        const auto shift = static_cast<uint8_t>(prec_in - OUT_BITS);
-        out = (shift >= 64) ? 0 : (out >> shift);
-    } else if (prec_in < OUT_BITS) {
-        const auto shift = static_cast<uint8_t>(OUT_BITS - prec_in);
-        out = (shift >= 64) ? 0 : (out << shift);
-    }
-
-    out = std::min<uint64_t>(out, OUT_MAX);
-
-    return static_cast<uint16_t>(out);
 }
 
 struct MXFJ2KSourceData {
@@ -963,15 +1012,15 @@ struct MXFJ2KSourceData {
     std::unordered_map<std::thread::id, std::unique_ptr<MxfDiskFile>> file_pool;
 };
 
-static MXFFile* get_thread_file(MXFJ2KSourceData* d) {
+static MxfDiskFile* get_thread_file(MXFJ2KSourceData* d) {
     const auto tid = std::this_thread::get_id();
     std::scoped_lock lk(d->file_pool_mutex);
     if (auto it = d->file_pool.find(tid); it != d->file_pool.end()) {
-        return it->second->get();
+        return it->second.get();
     }
 
     auto fh = std::make_unique<MxfDiskFile>(d->path);
-    MXFFile* raw = fh->get();
+    MxfDiskFile* raw = fh.get();
     d->file_pool.emplace(tid, std::move(fh));
     return raw;
 }
@@ -1002,12 +1051,13 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         const int fn = std::clamp(n, 0, last);
         const FrameIndex& idx = d->frames.at(static_cast<size_t>(fn));
 
-        MXFFile* file = get_thread_file(d);
-        auto frame_buf_exp = read_at(file, idx.value_offset, idx.value_size);
-        if (!frame_buf_exp) {
-            throw std::runtime_error(frame_buf_exp.error());
+        MxfDiskFile* disk = get_thread_file(d);
+        std::span<uint8_t> frame_buf =
+            disk->scratchBuf(static_cast<size_t>(idx.value_size));
+        if (auto read_exp = read_at(disk->get(), idx.value_offset, frame_buf);
+            !read_exp) {
+            throw std::runtime_error(read_exp.error());
         }
-        std::vector<uint8_t> frame_buf = std::move(*frame_buf_exp);
 
         grok_init_once();
 
@@ -1099,29 +1149,30 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
             uint8_t* dstp = vsapi->getWritePtr(dst.get(), plane);
 
             const uint32_t src_stride = comp->stride; // samples, not bytes
-            std::span<const int32_t> src_plane(
-                src, static_cast<size_t>(src_stride) * static_cast<size_t>(h));
-            std::span<uint8_t> dst_plane(dstp,
-                                         static_cast<size_t>(dst_stride_bytes) *
-                                             static_cast<size_t>(h));
-            for (int y = 0; y < h; ++y) {
-                const auto src_row = src_plane.subspan(
-                    static_cast<size_t>(y) * static_cast<size_t>(src_stride),
-                    static_cast<size_t>(w));
-                const auto dst_row_bytes = dst_plane.subspan(
-                    static_cast<size_t>(y) *
-                        static_cast<size_t>(dst_stride_bytes),
-                    static_cast<size_t>(w) * sizeof(uint16_t));
-                auto* dst_row_ptr =
-                    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-                    reinterpret_cast<uint16_t*>(dst_row_bytes.data());
-                std::span<uint16_t> dst_row(dst_row_ptr,
-                                            static_cast<size_t>(w));
-                for (int x = 0; x < w; ++x) {
-                    dst_row[static_cast<size_t>(x)] = convert_sample_to_u12(
-                        src_row[static_cast<size_t>(x)], prec_in, signed_in);
+            const int out_bits = d->vi.format.bitsPerSample;
+            if (out_bits == VAPOURSYNTH_RGB36_BITS) {
+                if (prec_in != VAPOURSYNTH_RGB36_BITS) {
+                    throw std::runtime_error(std::format(
+                        "grok: unexpected component precision {} (expected {})",
+                        prec_in, VAPOURSYNTH_RGB36_BITS));
                 }
+                copy_plane_to_u12(w, h, src, src_stride, dstp, dst_stride_bytes,
+                                  signed_in);
+                return;
             }
+            if (out_bits == VAPOURSYNTH_RGB48_BITS) {
+                if (prec_in != VAPOURSYNTH_RGB48_BITS) {
+                    throw std::runtime_error(std::format(
+                        "grok: unexpected component precision {} (expected {})",
+                        prec_in, VAPOURSYNTH_RGB48_BITS));
+                }
+                copy_plane_to_u16(w, h, src, src_stride, dstp, dst_stride_bytes,
+                                  signed_in);
+                return;
+            }
+
+            throw std::runtime_error(
+                "Internal error: unsupported output bit depth");
         };
 
         copy_plane(0, c0);
@@ -1219,31 +1270,29 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         }
 
         MxfDiskFile file(src);
-        auto first_exp = read_at(file.get(), frames_exp->front().value_offset,
-                                 frames_exp->front().value_size);
-        if (!first_exp) {
+        std::span<uint8_t> first_frame = file.scratchBuf(
+            static_cast<size_t>(frames_exp->front().value_size));
+        if (auto first_exp = read_at(
+                file.get(), frames_exp->front().value_offset, first_frame);
+            !first_exp) {
             const std::string msg =
                 std::format("Source: {}", first_exp.error());
             vsapi->mapSetError(out, msg.c_str());
             return;
         }
-        std::vector<uint8_t> first_frame = std::move(*first_exp);
 
-        auto hdr_exp = probe_j2k_header(
-            std::span<uint8_t>(first_frame.data(), first_frame.size()));
+        auto hdr_exp = probe_j2k_header(first_frame);
         if (!hdr_exp && track_info.track_number) {
             if (!track_forced) {
                 auto retry_frames =
                     index_j2k_essence_frames(src, std::nullopt, cache_path,
                                              cache_path_forced, core, vsapi);
                 if (retry_frames && !retry_frames->empty()) {
-                    auto retry_first =
-                        read_at(file.get(), retry_frames->front().value_offset,
-                                retry_frames->front().value_size);
-                    if (retry_first) {
-                        first_frame = std::move(*retry_first);
-                        auto retry_hdr = probe_j2k_header(std::span<uint8_t>(
-                            first_frame.data(), first_frame.size()));
+                    first_frame = file.scratchBuf(
+                        static_cast<size_t>(retry_frames->front().value_size));
+                    if (read_at(file.get(), retry_frames->front().value_offset,
+                                first_frame)) {
+                        auto retry_hdr = probe_j2k_header(first_frame);
                         if (retry_hdr) {
                             vsapi->logMessage(
                                 mtWarning,
@@ -1269,11 +1318,43 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         }
         const J2KHeaderInfo hdr = *hdr_exp;
 
+        if (hdr.num_comps < 3) {
+            const std::string msg = std::format(
+                "Source: JPEG 2000 must have at least 3 components (got {})",
+                hdr.num_comps);
+            vsapi->mapSetError(out, msg.c_str());
+            return;
+        }
+        if (!hdr.first_three_full_res) {
+            vsapi->mapSetError(out,
+                               "Source: only 4:4:4 JPEG 2000 is supported");
+            return;
+        }
+        if (!hdr.first_three_same_prec) {
+            vsapi->mapSetError(out, "Source: component bit depths must match "
+                                    "(12-bit or 16-bit for all components)");
+            return;
+        }
+        if (hdr.prec != VAPOURSYNTH_RGB36_BITS &&
+            hdr.prec != VAPOURSYNTH_RGB48_BITS) {
+            const std::string msg =
+                std::format("Source: unsupported JPEG 2000 bit depth {} "
+                            "(expected 12 or 16)",
+                            hdr.prec);
+            vsapi->mapSetError(out, msg.c_str());
+            return;
+        }
+
+        const int out_bits = hdr.prec;
+        const char* out_name =
+            (out_bits == VAPOURSYNTH_RGB48_BITS) ? "RGB48" : "RGB36";
+
         VSVideoFormat fmt{};
-        if (vsapi->queryVideoFormat(&fmt, cfRGB, stInteger,
-                                    VAPOURSYNTH_RGB36_BITS, 0, 0, core) == 0) {
-            vsapi->mapSetError(
-                out, "Source: VapourSynth core does not support RGB36");
+        if (vsapi->queryVideoFormat(&fmt, cfRGB, stInteger, out_bits, 0, 0,
+                                    core) == 0) {
+            const std::string msg = std::format(
+                "Source: VapourSynth core does not support {}", out_name);
+            vsapi->mapSetError(out, msg.c_str());
             return;
         }
 
