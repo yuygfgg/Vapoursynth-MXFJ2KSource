@@ -1307,7 +1307,7 @@ VS_EXTERNAL_API(void)
 VapourSynthPluginInit2( // NOLINT(readability-identifier-naming)
     VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
     vspapi->configPlugin("com.yuygfgg.mxfj2ksource", "MXFJ2KSource",
-                         "JPEG 2000 MXF source", VS_MAKE_VERSION(1, 0),
+                         "JPEG 2000 MXF source", VS_MAKE_VERSION(1, 1),
                          VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
         "Source", "source:data;track:int:opt;cache_path:data:opt;",
