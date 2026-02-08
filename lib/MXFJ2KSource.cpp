@@ -143,7 +143,10 @@ class MxfDiskFile final {
             scratch_size = 0;
             return {};
         }
+
+        // NOLINTNEXTLINE(readability-use-std-min-max)
         if (scratch_capacity < size) {
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
             scratch = std::make_unique_for_overwrite<uint8_t[]>(size);
             scratch_capacity = size;
         }
@@ -154,6 +157,7 @@ class MxfDiskFile final {
   private:
     MXFFile* file = nullptr;
 
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,modernize-avoid-c-arrays)
     std::unique_ptr<uint8_t[]> scratch;
     size_t scratch_capacity = 0;
     size_t scratch_size = 0;
@@ -168,6 +172,32 @@ struct GrokCodecDeleter {
     }
 };
 using GrokCodecPtr = std::unique_ptr<grk_object, GrokCodecDeleter>;
+
+[[nodiscard]] static std::expected<GrokCodecPtr, std::string>
+grok_init_codec_and_read_header(std::span<uint8_t> buf) {
+    grok_init_once();
+
+    grk_stream_params sp{};
+    sp.buf = buf.data();
+    sp.buf_len = buf.size();
+
+    grk_decompress_parameters params{};
+    params.decod_format = GRK_CODEC_J2K;
+    params.cod_format = GRK_FMT_J2K;
+
+    GrokCodecPtr codec(grk_decompress_init(&sp, &params));
+    if (!codec) {
+        return std::unexpected("grok: grk_decompress_init failed");
+    }
+
+    grk_header_info header{};
+    header.decompress_fmt = GRK_FMT_J2K;
+    if (!grk_decompress_read_header(codec.get(), &header)) {
+        return std::unexpected("grok: grk_decompress_read_header failed");
+    }
+
+    return codec;
+}
 
 [[nodiscard]] static std::expected<VideoTrackInfo, std::string>
 probe_mxf_video_track(const std::string& path) {
@@ -510,8 +540,7 @@ static std::optional<FileStamp> try_get_file_stamp(const fs::path& path) {
         }
         mtime = static_cast<int64_t>(rep);
     } else {
-        if (rep > static_cast<std::make_unsigned_t<int64_t>>(
-                      std::numeric_limits<int64_t>::max())) {
+        if (std::cmp_greater(rep, std::numeric_limits<int64_t>::max())) {
             return std::nullopt;
         }
         mtime = static_cast<int64_t>(rep);
@@ -793,12 +822,30 @@ index_j2k_essence_frames(const std::string& path,
     }
 
     if (cache_path && stamp) {
-        try {
-            IndexCacheFile cache{};
-            cache.src_stamp = *stamp;
-            if (existing_cache && existing_cache->src_stamp == *stamp) {
-                cache = std::move(*existing_cache);
+        const fs::path& cache_path_fs = *cache_path;
+
+        auto report_cache_write_failure =
+            [&](std::string_view why) -> std::optional<std::string> {
+            std::string why_full =
+                std::format("Failed to write index cache '{}': {}",
+                            cache_path_fs.string(), why);
+            if (cache_path_forced) {
+                return std::move(why_full);
             }
+            if (vsapi != nullptr && core != nullptr) {
+                const std::string msg =
+                    std::format("MXFJ2KSource: {}", why_full);
+                vsapi->logMessage(mtWarning, msg.c_str(), core);
+            }
+            return std::nullopt;
+        };
+
+        try {
+            IndexCacheFile cache =
+                (existing_cache && existing_cache->src_stamp == *stamp)
+                    ? std::move(*existing_cache)
+                    : IndexCacheFile{};
+            cache.src_stamp = *stamp;
 
             bool updated = false;
             for (IndexCacheEntry& e : cache.entries) {
@@ -815,32 +862,15 @@ index_j2k_essence_frames(const std::string& path,
                 });
             }
 
-            auto write_exp = write_index_cache_file(*cache_path, cache);
+            auto write_exp = write_index_cache_file(cache_path_fs, cache);
             if (!write_exp) {
-                const std::string why =
-                    std::format("Failed to write index cache '{}': {}",
-                                cache_path->string(), write_exp.error());
-                if (cache_path_forced) {
-                    return std::unexpected(why);
-                }
-                if (vsapi != nullptr && core != nullptr) {
-                    const std::string msg =
-                        std::format("MXFJ2KSource: {}", why);
-                    vsapi->logMessage(mtWarning, msg.c_str(), core);
+                if (auto err = report_cache_write_failure(write_exp.error())) {
+                    return std::unexpected(*err);
                 }
             }
         } catch (...) {
-            if (cache_path_forced) {
-                return std::unexpected(std::format(
-                    "Failed to write index cache '{}': unknown error",
-                    cache_path->string()));
-            }
-            if (vsapi != nullptr && core != nullptr) {
-                const std::string msg = std::format(
-                    "MXFJ2KSource: Failed to write index cache '{}': unknown "
-                    "error",
-                    cache_path->string());
-                vsapi->logMessage(mtWarning, msg.c_str(), core);
+            if (auto err = report_cache_write_failure("unknown error")) {
+                return std::unexpected(*err);
             }
         }
     }
@@ -869,8 +899,11 @@ read_at(MXFFile* file, uint64_t offset, std::span<uint8_t> buf) {
 
     uint32_t got = 0;
     while (got < size) {
-        const uint32_t n = mxf_file_read(file, buf.data() + got,
-                                         static_cast<uint32_t>(size - got));
+        const auto tail = buf.subspan(static_cast<size_t>(got));
+        const uint32_t n = mxf_file_read(
+            file, tail.data(),
+            static_cast<uint32_t>(std::min<size_t>(
+                tail.size(), std::numeric_limits<uint32_t>::max())));
         if (n == 0) {
             break;
         }
@@ -890,26 +923,11 @@ probe_j2k_header(std::span<uint8_t> buf) {
             "Essence does not look like a JPEG 2000 codestream (missing SOC)");
     }
 
-    grok_init_once();
-
-    grk_stream_params sp{};
-    sp.buf = buf.data();
-    sp.buf_len = buf.size();
-
-    grk_decompress_parameters params{};
-    params.decod_format = GRK_CODEC_J2K;
-    params.cod_format = GRK_FMT_J2K;
-
-    GrokCodecPtr codec(grk_decompress_init(&sp, &params));
-    if (!codec) {
-        return std::unexpected("grok: grk_decompress_init failed");
+    auto codec_exp = grok_init_codec_and_read_header(buf);
+    if (!codec_exp) {
+        return std::unexpected(codec_exp.error());
     }
-
-    grk_header_info header{};
-    header.decompress_fmt = GRK_FMT_J2K;
-    if (!grk_decompress_read_header(codec.get(), &header)) {
-        return std::unexpected("grok: grk_decompress_read_header failed");
-    }
+    GrokCodecPtr codec = std::move(*codec_exp);
 
     grk_image* img = grk_decompress_get_image(codec.get());
     if (img == nullptr) {
@@ -926,7 +944,8 @@ probe_j2k_header(std::span<uint8_t> buf) {
         return std::unexpected("grok: invalid component data in header image");
     }
 
-    const std::span<const grk_image_comp> comps(img->comps, img->numcomps);
+    const std::span<const grk_image_comp> comps(
+        img->comps, static_cast<size_t>(img->numcomps));
 
     J2KHeaderInfo info{};
     info.width = w;
@@ -951,53 +970,54 @@ probe_j2k_header(std::span<uint8_t> buf) {
     return info;
 }
 
-static inline void copy_plane_to_u12(int w, int h, const int32_t* src,
-                                     uint32_t src_stride_samples, uint8_t* dstp,
-                                     ptrdiff_t dst_stride_bytes,
-                                     bool signed_in) {
-    static constexpr int64_t OUT_MAX =
-        (int64_t{1} << VAPOURSYNTH_RGB36_BITS) - 1;
-    const int64_t offset =
-        signed_in ? (int64_t{1} << (VAPOURSYNTH_RGB36_BITS - 1)) : 0;
+template <int OUT_BITS>
+static inline void copy_plane(int w, int h, const int32_t* src,
+                              uint32_t src_stride_samples, uint8_t* dstp,
+                              ptrdiff_t dst_stride_bytes, bool signed_in) {
+    static constexpr int MAX_OUT_BITS = std::numeric_limits<uint16_t>::digits;
+    static_assert(OUT_BITS > 0 && OUT_BITS <= MAX_OUT_BITS,
+                  "copy_plane only supports 1..16-bit output");
 
-    for (int y = 0; y < h; ++y) {
-        const auto* src_row = src + static_cast<size_t>(y) *
-                                        static_cast<size_t>(src_stride_samples);
-        auto* dst_row =
-            // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-            reinterpret_cast<uint16_t*>(
-                dstp +
-                static_cast<size_t>(y) * static_cast<size_t>(dst_stride_bytes));
-        for (int x = 0; x < w; ++x) {
-            const int64_t vv =
-                static_cast<int64_t>(src_row[static_cast<size_t>(x)]) + offset;
-            dst_row[static_cast<size_t>(x)] =
-                static_cast<uint16_t>(std::clamp<int64_t>(vv, 0, OUT_MAX));
-        }
+    static constexpr int64_t OUT_MAX = (int64_t{1} << OUT_BITS) - 1;
+    const int64_t offset =
+        signed_in ? (int64_t{1} << (OUT_BITS - 1)) : int64_t{0};
+
+    if (w <= 0 || h <= 0) {
+        return;
     }
-}
 
-static inline void copy_plane_to_u16(int w, int h, const int32_t* src,
-                                     uint32_t src_stride_samples, uint8_t* dstp,
-                                     ptrdiff_t dst_stride_bytes,
-                                     bool signed_in) {
-    static constexpr int64_t OUT_MAX =
-        (int64_t{1} << VAPOURSYNTH_RGB48_BITS) - 1;
-    const int64_t offset =
-        signed_in ? (int64_t{1} << (VAPOURSYNTH_RGB48_BITS - 1)) : 0;
+    if (dst_stride_bytes < 0) {
+        throw std::runtime_error("Internal error: negative destination stride");
+    }
+    const auto dst_stride_bytes_u = static_cast<size_t>(dst_stride_bytes);
+    if ((dst_stride_bytes_u % sizeof(uint16_t)) != 0) {
+        throw std::runtime_error(
+            "Internal error: destination stride not aligned to uint16_t");
+    }
 
-    for (int y = 0; y < h; ++y) {
-        const auto* src_row = src + (static_cast<size_t>(y) *
-                                     static_cast<size_t>(src_stride_samples));
-        auto* dst_row =
+    const auto w_sz = static_cast<size_t>(w);
+    const auto h_sz = static_cast<size_t>(h);
+    const auto src_stride = static_cast<size_t>(src_stride_samples);
+    const size_t dst_stride_samples = dst_stride_bytes_u / sizeof(uint16_t);
+
+    const auto src_span = std::span<const int32_t>(src, h_sz * src_stride);
+    const auto dst_span_bytes =
+        std::span<uint8_t>(dstp, h_sz * dst_stride_bytes_u);
+
+    for (size_t y = 0; y < h_sz; ++y) {
+        const auto src_row =
+            src_span.subspan(y * src_stride, src_stride).first(w_sz);
+        auto* row_bytes =
+            dst_span_bytes.subspan(y * dst_stride_bytes_u, dst_stride_bytes_u)
+                .data();
+        auto* dst_row_ptr =
             // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
-            reinterpret_cast<uint16_t*>(
-                dstp + (static_cast<size_t>(y) *
-                        static_cast<size_t>(dst_stride_bytes)));
-        for (int x = 0; x < w; ++x) {
-            const int64_t vv =
-                static_cast<int64_t>(src_row[static_cast<size_t>(x)]) + offset;
-            dst_row[static_cast<size_t>(x)] =
+            reinterpret_cast<uint16_t*>(row_bytes);
+        auto dst_row = std::span<uint16_t>(dst_row_ptr, dst_stride_samples);
+
+        for (size_t x = 0; x < w_sz; ++x) {
+            const int64_t vv = static_cast<int64_t>(src_row[x]) + offset;
+            dst_row[x] =
                 static_cast<uint16_t>(std::clamp<int64_t>(vv, 0, OUT_MAX));
         }
     }
@@ -1059,26 +1079,11 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
             throw std::runtime_error(read_exp.error());
         }
 
-        grok_init_once();
-
-        grk_stream_params sp{};
-        sp.buf = frame_buf.data();
-        sp.buf_len = frame_buf.size();
-
-        grk_decompress_parameters params{};
-        params.decod_format = GRK_CODEC_J2K;
-        params.cod_format = GRK_FMT_J2K;
-
-        GrokCodecPtr codec(grk_decompress_init(&sp, &params));
-        if (!codec) {
-            throw std::runtime_error("grok: grk_decompress_init failed");
+        auto codec_exp = grok_init_codec_and_read_header(frame_buf);
+        if (!codec_exp) {
+            throw std::runtime_error(codec_exp.error());
         }
-
-        grk_header_info header{};
-        header.decompress_fmt = GRK_FMT_J2K;
-        if (!grk_decompress_read_header(codec.get(), &header)) {
-            throw std::runtime_error("grok: grk_decompress_read_header failed");
-        }
+        GrokCodecPtr codec = std::move(*codec_exp);
 
         if (!grk_decompress(codec.get(), nullptr)) {
             throw std::runtime_error("grok: grk_decompress failed");
@@ -1112,7 +1117,8 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         }
 
         const uint16_t ncomps = img->numcomps;
-        const std::span<const grk_image_comp> comps(img->comps, ncomps);
+        const std::span<const grk_image_comp> comps(
+            img->comps, static_cast<size_t>(ncomps));
         const grk_image_comp* c0 = &comps.front();
         const grk_image_comp* c1 = (ncomps >= 2) ? &comps[1] : c0;
         const grk_image_comp* c2 = (ncomps >= 3) ? &comps[2] : c0;
@@ -1139,7 +1145,7 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         validate_comp(c1);
         validate_comp(c2);
 
-        auto copy_plane = [&](int plane, const grk_image_comp* comp) {
+        auto copy_plane_from_comp = [&](int plane, const grk_image_comp* comp) {
             const uint8_t prec_in = comp->prec;
             const bool signed_in = comp->sgnd;
             const auto* src = static_cast<const int32_t*>(comp->data);
@@ -1156,8 +1162,8 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
                         "grok: unexpected component precision {} (expected {})",
                         prec_in, VAPOURSYNTH_RGB36_BITS));
                 }
-                copy_plane_to_u12(w, h, src, src_stride, dstp, dst_stride_bytes,
-                                  signed_in);
+                copy_plane<VAPOURSYNTH_RGB36_BITS>(w, h, src, src_stride, dstp,
+                                                   dst_stride_bytes, signed_in);
                 return;
             }
             if (out_bits == VAPOURSYNTH_RGB48_BITS) {
@@ -1166,8 +1172,8 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
                         "grok: unexpected component precision {} (expected {})",
                         prec_in, VAPOURSYNTH_RGB48_BITS));
                 }
-                copy_plane_to_u16(w, h, src, src_stride, dstp, dst_stride_bytes,
-                                  signed_in);
+                copy_plane<VAPOURSYNTH_RGB48_BITS>(w, h, src, src_stride, dstp,
+                                                   dst_stride_bytes, signed_in);
                 return;
             }
 
@@ -1175,9 +1181,9 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
                 "Internal error: unsupported output bit depth");
         };
 
-        copy_plane(0, c0);
-        copy_plane(1, c1);
-        copy_plane(2, c2);
+        copy_plane_from_comp(0, c0);
+        copy_plane_from_comp(1, c1);
+        copy_plane_from_comp(2, c2);
 
         return dst.release();
     } catch (const std::exception& e) {
