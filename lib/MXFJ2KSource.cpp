@@ -1289,9 +1289,9 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         d->vi.fpsDen = track_info.fps_den;
         vsh::reduceRational(&d->vi.fpsNum, &d->vi.fpsDen);
 
-        vsapi->createVideoFilter(out, "MXFJ2KSource.Source", &d->vi,
-                                 mxfj2k_get_frame, mxfj2k_free, fmUnordered,
-                                 nullptr, 0, d.get(), core);
+        vsapi->createVideoFilter(out, "Source", &d->vi, mxfj2k_get_frame,
+                                 mxfj2k_free, fmUnordered, nullptr, 0, d.get(),
+                                 core);
         (void)d.release();
     } catch (const std::exception& e) {
         const std::string msg = std::format("Source: {}", e.what());
