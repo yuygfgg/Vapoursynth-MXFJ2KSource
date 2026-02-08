@@ -12,11 +12,15 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <expected>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -24,12 +28,25 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace mxfj2ksource {
+
+namespace fs = std::filesystem;
+
+static fs::path path_from_utf8(std::string_view s) {
+    std::u8string u8;
+    u8.reserve(s.size());
+    for (unsigned char ch : s) {
+        u8.push_back(static_cast<char8_t>(ch));
+    }
+    return fs::path(u8);
+}
 
 static constexpr int DEFAULT_FPS_NUM = 24;
 static constexpr int DEFAULT_FPS_DEN = 1;
@@ -415,9 +432,229 @@ detect_and_set_runin_len(MXFFile* file) {
     return static_cast<uint16_t>(runin);
 }
 
+struct FileStamp {
+    uint64_t size = 0;
+    int64_t mtime = 0;
+};
+
+static bool operator==(const FileStamp& a, const FileStamp& b) noexcept {
+    return a.size == b.size && a.mtime == b.mtime;
+}
+
+template <typename T> static void write_le(std::ostream& os, T v) {
+    static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool>);
+    if constexpr (std::endian::native == std::endian::big && sizeof(T) > 1) {
+        v = std::byteswap(v);
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    os.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+
+template <typename T> static bool read_le(std::istream& is, T& v) {
+    static_assert(std::is_integral_v<T> && !std::is_same_v<T, bool>);
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    is.read(reinterpret_cast<char*>(&v), sizeof(v));
+    if (!is) {
+        return false;
+    }
+    if constexpr (std::endian::native == std::endian::big && sizeof(T) > 1) {
+        v = std::byteswap(v);
+    }
+    return true;
+}
+
+static std::optional<FileStamp> try_get_file_stamp(const fs::path& path) {
+    std::error_code ec;
+    const uintmax_t size_umax = fs::file_size(path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+    if (size_umax > std::numeric_limits<uint64_t>::max()) {
+        return std::nullopt;
+    }
+
+    const fs::file_time_type ft = fs::last_write_time(path, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+
+    using Rep = decltype(ft.time_since_epoch().count());
+    const Rep rep = ft.time_since_epoch().count();
+    int64_t mtime = 0;
+    if constexpr (std::numeric_limits<Rep>::is_signed) {
+        if (rep < std::numeric_limits<int64_t>::min() ||
+            rep > std::numeric_limits<int64_t>::max()) {
+            return std::nullopt;
+        }
+        mtime = static_cast<int64_t>(rep);
+    } else {
+        if (rep > static_cast<std::make_unsigned_t<int64_t>>(
+                      std::numeric_limits<int64_t>::max())) {
+            return std::nullopt;
+        }
+        mtime = static_cast<int64_t>(rep);
+    }
+
+    return FileStamp{.size = static_cast<uint64_t>(size_umax), .mtime = mtime};
+}
+
+struct IndexCacheEntry {
+    std::optional<uint32_t> desired_track_number;
+    std::vector<FrameIndex> frames;
+};
+
+struct IndexCacheFile {
+    FileStamp src_stamp{};
+    std::vector<IndexCacheEntry> entries;
+};
+
+static constexpr std::array<uint8_t, 8> INDEX_CACHE_MAGIC{'M', 'X', 'F', 'J',
+                                                          '2', 'K', 'I', 'X'};
+static constexpr uint32_t INDEX_CACHE_VERSION = 1;
+static constexpr uint32_t INDEX_CACHE_MAX_ENTRIES = 128;
+static constexpr uint32_t INDEX_CACHE_MAX_FRAMES = 50'000'000;
+
+static std::optional<IndexCacheFile>
+try_read_index_cache_file(const fs::path& cache_path) {
+    std::ifstream in(cache_path, std::ios::binary);
+    if (!in) {
+        return std::nullopt;
+    }
+
+    std::array<uint8_t, INDEX_CACHE_MAGIC.size()> magic{};
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    in.read(reinterpret_cast<char*>(magic.data()),
+            static_cast<std::streamsize>(magic.size()));
+    if (!in || magic != INDEX_CACHE_MAGIC) {
+        return std::nullopt;
+    }
+
+    uint32_t version = 0;
+    if (!read_le(in, version) || version != INDEX_CACHE_VERSION) {
+        return std::nullopt;
+    }
+
+    IndexCacheFile cache{};
+    if (!read_le(in, cache.src_stamp.size) ||
+        !read_le(in, cache.src_stamp.mtime)) {
+        return std::nullopt;
+    }
+
+    uint32_t entry_count = 0;
+    if (!read_le(in, entry_count) || entry_count > INDEX_CACHE_MAX_ENTRIES) {
+        return std::nullopt;
+    }
+
+    cache.entries.reserve(entry_count);
+    for (uint32_t i = 0; i < entry_count; ++i) {
+        uint8_t has_track = 0;
+        if (!read_le(in, has_track)) {
+            return std::nullopt;
+        }
+
+        uint32_t track_number = 0;
+        if (!read_le(in, track_number)) {
+            return std::nullopt;
+        }
+
+        uint32_t frame_count = 0;
+        if (!read_le(in, frame_count) || frame_count > INDEX_CACHE_MAX_FRAMES) {
+            return std::nullopt;
+        }
+
+        IndexCacheEntry e{};
+        e.desired_track_number = (has_track != 0)
+                                     ? std::optional<uint32_t>(track_number)
+                                     : std::nullopt;
+        e.frames.reserve(frame_count);
+
+        for (uint32_t j = 0; j < frame_count; ++j) {
+            FrameIndex fi{};
+            if (!read_le(in, fi.value_offset) || !read_le(in, fi.value_size)) {
+                return std::nullopt;
+            }
+            e.frames.push_back(fi);
+        }
+
+        cache.entries.push_back(std::move(e));
+    }
+
+    return cache;
+}
+
+static std::expected<void, std::string>
+write_index_cache_file(const fs::path& cache_path,
+                       const IndexCacheFile& cache) {
+    std::error_code ec;
+    const fs::path parent = cache_path.parent_path();
+    if (!parent.empty() && !fs::exists(parent, ec)) {
+        return std::unexpected("Cache directory does not exist");
+    }
+
+    fs::path tmp = cache_path;
+    tmp += ".tmp.";
+    tmp += std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        return std::unexpected("Failed to open cache file for writing");
+    }
+
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-reinterpret-cast)
+    out.write(reinterpret_cast<const char*>(INDEX_CACHE_MAGIC.data()),
+              static_cast<std::streamsize>(INDEX_CACHE_MAGIC.size()));
+    write_le(out, INDEX_CACHE_VERSION);
+
+    write_le(out, cache.src_stamp.size);
+    write_le(out, cache.src_stamp.mtime);
+
+    const auto entry_count_u32 = static_cast<uint32_t>(
+        std::min<size_t>(cache.entries.size(), INDEX_CACHE_MAX_ENTRIES));
+    write_le(out, entry_count_u32);
+
+    for (uint32_t i = 0; i < entry_count_u32; ++i) {
+        const IndexCacheEntry& e = cache.entries.at(i);
+        const uint8_t has_track = e.desired_track_number ? 1 : 0;
+        write_le(out, has_track);
+        write_le(out, e.desired_track_number.value_or(0U));
+
+        const auto frame_count_u32 = static_cast<uint32_t>(
+            std::min<size_t>(e.frames.size(), INDEX_CACHE_MAX_FRAMES));
+        write_le(out, frame_count_u32);
+        for (uint32_t j = 0; j < frame_count_u32; ++j) {
+            const FrameIndex& fi = e.frames.at(j);
+            write_le(out, fi.value_offset);
+            write_le(out, fi.value_size);
+        }
+    }
+
+    out.flush();
+    if (!out) {
+        out.close();
+        (void)fs::remove(tmp, ec);
+        return std::unexpected("Failed while writing cache file");
+    }
+    out.close();
+
+    fs::rename(tmp, cache_path, ec);
+    if (ec) {
+        (void)fs::remove(cache_path, ec);
+        ec.clear();
+        fs::rename(tmp, cache_path, ec);
+        if (ec) {
+            (void)fs::remove(tmp, ec);
+            return std::unexpected("Failed to replace cache file");
+        }
+    }
+
+    return {};
+}
+
 static std::expected<std::vector<FrameIndex>, std::string>
-index_j2k_essence_frames(const std::string& path,
-                         const std::optional<uint32_t> desired_track_number) {
+index_j2k_essence_frames_scan(
+    const std::string& path,
+    const std::optional<uint32_t> desired_track_number) {
     try {
         MxfDiskFile f(path);
 
@@ -503,6 +740,92 @@ index_j2k_essence_frames(const std::string& path,
     }
 }
 
+static std::expected<std::vector<FrameIndex>, std::string>
+index_j2k_essence_frames(const std::string& path,
+                         const std::optional<uint32_t> desired_track_number,
+                         const std::optional<fs::path>& cache_path,
+                         bool cache_path_forced, VSCore* core,
+                         const VSAPI* vsapi) {
+    const fs::path src_fs = path_from_utf8(path);
+    const std::optional<FileStamp> stamp = try_get_file_stamp(src_fs);
+
+    if (cache_path && stamp) {
+        try {
+            if (auto cache = try_read_index_cache_file(*cache_path);
+                cache && cache->src_stamp == *stamp) {
+                for (const IndexCacheEntry& e : cache->entries) {
+                    if (e.desired_track_number == desired_track_number) {
+                        return e.frames;
+                    }
+                }
+            }
+        } catch (...) {
+            // Ignore cache read failures and fall back to indexing.
+        }
+    }
+
+    auto frames_exp = index_j2k_essence_frames_scan(path, desired_track_number);
+    if (!frames_exp) {
+        return frames_exp;
+    }
+
+    if (cache_path && stamp) {
+        try {
+            IndexCacheFile cache{};
+            cache.src_stamp = *stamp;
+            if (auto existing = try_read_index_cache_file(*cache_path);
+                existing && existing->src_stamp == *stamp) {
+                cache = std::move(*existing);
+            }
+
+            bool updated = false;
+            for (IndexCacheEntry& e : cache.entries) {
+                if (e.desired_track_number == desired_track_number) {
+                    e.frames = *frames_exp;
+                    updated = true;
+                    break;
+                }
+            }
+            if (!updated) {
+                cache.entries.push_back(IndexCacheEntry{
+                    .desired_track_number = desired_track_number,
+                    .frames = *frames_exp,
+                });
+            }
+
+            auto write_exp = write_index_cache_file(*cache_path, cache);
+            if (!write_exp) {
+                const std::string why =
+                    std::format("Failed to write index cache '{}': {}",
+                                cache_path->string(), write_exp.error());
+                if (cache_path_forced) {
+                    return std::unexpected(why);
+                }
+                if (vsapi != nullptr && core != nullptr) {
+                    const std::string msg =
+                        std::format("MXFJ2KSource: {}", why);
+                    vsapi->logMessage(mtWarning, msg.c_str(), core);
+                }
+            }
+        } catch (...) {
+            if (cache_path_forced) {
+                return std::unexpected(std::format(
+                    "Failed to write index cache '{}': unknown error",
+                    cache_path->string()));
+            }
+            if (vsapi != nullptr && core != nullptr) {
+                const std::string msg = std::format(
+                    "MXFJ2KSource: Failed to write index cache '{}': unknown "
+                    "error",
+                    cache_path->string());
+                vsapi->logMessage(mtWarning, msg.c_str(), core);
+            }
+        }
+    }
+
+    return frames_exp;
+}
+
 static std::expected<std::vector<uint8_t>, std::string>
 read_at(MXFFile* file, uint64_t offset, uint32_t size) {
     if (size == 0) {
@@ -550,7 +873,8 @@ probe_j2k_header(std::span<uint8_t> buf) {
     sp.buf_len = buf.size();
 
     grk_decompress_parameters params{};
-    params.cod_format = GRK_FMT_UNK;
+    params.decod_format = GRK_CODEC_J2K;
+    params.cod_format = GRK_FMT_J2K;
 
     GrokCodecPtr codec(grk_decompress_init(&sp, &params));
     if (!codec) {
@@ -558,7 +882,7 @@ probe_j2k_header(std::span<uint8_t> buf) {
     }
 
     grk_header_info header{};
-    header.decompress_fmt = GRK_FMT_UNK;
+    header.decompress_fmt = GRK_FMT_J2K;
     if (!grk_decompress_read_header(codec.get(), &header)) {
         return std::unexpected("grok: grk_decompress_read_header failed");
     }
@@ -692,7 +1016,8 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         sp.buf_len = frame_buf.size();
 
         grk_decompress_parameters params{};
-        params.cod_format = GRK_FMT_UNK;
+        params.decod_format = GRK_CODEC_J2K;
+        params.cod_format = GRK_FMT_J2K;
 
         GrokCodecPtr codec(grk_decompress_init(&sp, &params));
         if (!codec) {
@@ -700,7 +1025,7 @@ static const VSFrame* VS_CC mxfj2k_get_frame(int n, int activation_reason,
         }
 
         grk_header_info header{};
-        header.decompress_fmt = GRK_FMT_UNK;
+        header.decompress_fmt = GRK_FMT_J2K;
         if (!grk_decompress_read_header(codec.get(), &header)) {
             throw std::runtime_error("grok: grk_decompress_read_header failed");
         }
@@ -836,6 +1161,17 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
                 : std::nullopt;
         const bool track_forced = forced_track_number.has_value();
 
+        const char* cache_path_str =
+            vsapi->mapGetData(in, "cache_path", 0, &err);
+        const bool cache_path_forced = (err == 0) &&
+                                       (cache_path_str != nullptr) &&
+                                       (*cache_path_str != '\0');
+        const std::optional<fs::path> cache_path =
+            cache_path_forced
+                ? std::optional<fs::path>(path_from_utf8(cache_path_str))
+                : std::optional<fs::path>(
+                      path_from_utf8(src).concat(".mxfj2kindex"));
+
         VideoTrackInfo track_info{};
         if (auto track_info_exp = probe_mxf_video_track(src); track_info_exp) {
             track_info = *track_info_exp;
@@ -852,11 +1188,14 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         }
 
         auto frames_exp =
-            index_j2k_essence_frames(src, track_info.track_number);
+            index_j2k_essence_frames(src, track_info.track_number, cache_path,
+                                     cache_path_forced, core, vsapi);
         if (!frames_exp || frames_exp->empty()) {
             if (track_info.track_number) {
                 if (!track_forced) {
-                    auto retry = index_j2k_essence_frames(src, std::nullopt);
+                    auto retry = index_j2k_essence_frames(
+                        src, std::nullopt, cache_path, cache_path_forced, core,
+                        vsapi);
                     if (retry && !retry->empty()) {
                         frames_exp = std::move(retry);
                     }
@@ -894,7 +1233,9 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
             std::span<uint8_t>(first_frame.data(), first_frame.size()));
         if (!hdr_exp && track_info.track_number) {
             if (!track_forced) {
-                auto retry_frames = index_j2k_essence_frames(src, std::nullopt);
+                auto retry_frames =
+                    index_j2k_essence_frames(src, std::nullopt, cache_path,
+                                             cache_path_forced, core, vsapi);
                 if (retry_frames && !retry_frames->empty()) {
                     auto retry_first =
                         read_at(file.get(), retry_frames->front().value_offset,
@@ -968,7 +1309,7 @@ VapourSynthPluginInit2( // NOLINT(readability-identifier-naming)
     vspapi->configPlugin("com.yuygfgg.mxfj2ksource", "MXFJ2KSource",
                          "JPEG 2000 MXF source", VS_MAKE_VERSION(1, 0),
                          VAPOURSYNTH_API_VERSION, 0, plugin);
-    vspapi->registerFunction("Source", "source:data;track:int:opt;",
-                             "clip:vnode;", mxfj2ksource::mxfj2k_create,
-                             nullptr, plugin);
+    vspapi->registerFunction(
+        "Source", "source:data;track:int:opt;cache_path:data:opt;",
+        "clip:vnode;", mxfj2ksource::mxfj2k_create, nullptr, plugin);
 }

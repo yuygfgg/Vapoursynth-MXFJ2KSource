@@ -9,11 +9,14 @@ Vapoursynth video source plugin for reading JPEG 2000 picture essence from MXF f
 Loads a MXF file and returns a clip with the JPEG 2000 picture essence:
 
 ```
-core.MXFJ2KSource.Source(clip clip[, int track])
+core.MXFJ2KSource.Source(string source[, int track, string cache_path])
 ```
 
-- `clip`: MXF file path.
+- `source`: MXF file path.
 - `track`: Track number (optional)
+- `cache_path`: Index cache file path (optional). Default: `source + ".mxfj2kindex"`
+  - If you explicitly set `cache_path` and the cache cannot be written, the filter fails.
+  - If you use the default auto cache path and it cannot be written, a warning is logged and indexing continues.
 
 ## Building
 
