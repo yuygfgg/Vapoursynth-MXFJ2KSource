@@ -41,7 +41,7 @@ jobs:
           path: grok-prefix
           key: grok-${{ runner.os }}-${{ env.GROK_REF }}-mingw64-${{ hashFiles('.github/workflows/windows-static.yml') }}
 
-      - name: Build Grok (static)
+      - name: Build Grok
         if: steps.cache-grok.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail

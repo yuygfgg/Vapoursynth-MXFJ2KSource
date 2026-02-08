@@ -1,8 +1,21 @@
-# MXFJ2KSource (VapourSynth)
+# MXFJ2KSource
 
-VapourSynth video source plugin for reading JPEG 2000 picture essence from MXF files (e.g. DCP OP1a) and returning `RGB36` frames (RGB, integer, 12-bit).
+Vapoursynth video source plugin for reading JPEG 2000 picture essence from MXF files (e.g. DCP OP1a) and returning `RGB36` frames.
 
-## Build
+## Usage
+
+### Source
+
+Loads a MXF file and returns a clip with the JPEG 2000 picture essence:
+
+```
+core.MXFJ2KSource.Source(clip clip[, int track])
+```
+
+- `clip`: MXF file path.
+- `track`: Track number (optional)
+
+## Building
 
 Requirements:
 - VapourSynth headers
@@ -15,15 +28,3 @@ cmake --build build -j
 
 Output:
 - `build/libMXFJ2KSource.[dll|dylib|so]`
-
-## Usage
-
-```python
-import vapoursynth as vs
-core = vs.core
-
-core.std.LoadPlugin(path="/path/to/libMXFJ2KSource.dylib")
-clip = core.MXFJ2KSource.Source("/path/to/file.mxf")
-```
-
-Note: This plugin returns the three channels in an RGB container format without colour conversion.

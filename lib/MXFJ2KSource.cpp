@@ -389,14 +389,14 @@ detect_and_set_runin_len(MXFFile* file) {
         const auto b = static_cast<uint8_t>(ch);
         bool ok = false;
         if (matched < PREFIX.size()) {
-            ok = b == PREFIX[matched];
+            ok = b == PREFIX.at(matched);
         } else if (matched == PARTITION_LABEL_REGVER_OFFSET) {
             ok = (b == PARTITION_LABEL_REGVER_1) ||
                  (b == PARTITION_LABEL_REGVER_2);
         } else {
             const size_t suffix_index =
                 static_cast<size_t>(matched) - (PREFIX.size() + 1U);
-            ok = b == SUFFIX[suffix_index];
+            ok = b == SUFFIX.at(suffix_index);
         }
 
         if (ok) {
@@ -457,7 +457,7 @@ index_j2k_essence_frames(const std::string& path,
 
                     bool accept = true;
                     if (!desired_track_number) {
-                        const uint32_t sniff = static_cast<uint32_t>(
+                        const auto sniff = static_cast<uint32_t>(
                             std::min<uint64_t>(len, J2K_SOC_MARKER_SIZE));
                         std::array<uint8_t, J2K_SOC_MARKER_SIZE> prefix{};
                         uint32_t nread = 0;
