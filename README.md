@@ -18,7 +18,7 @@ core.MXFJ2KSource.Source(string source[, int track, string cache_path, int threa
   - If you explicitly set `cache_path` and the cache cannot be written, the filter fails.
   - If you use the default auto cache path and it cannot be written, a warning is logged and indexing continues.
 - `threads`: Grok thread count per frame (optional). `0` = all threads, `1` = single-thread.
-  - It is recommended to set this value to `1` (default when not specified), because Vapoursynth's frame-level parallelism is offers lower synchronization overhead.
+  - It is recommended to set this value to `1` (default when not specified), because Vapoursynth's frame-level parallelism offers lower synchronization overhead.
 
 Notes / limitations:
 
