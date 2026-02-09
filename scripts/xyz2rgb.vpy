@@ -68,7 +68,9 @@ def xyz2rgb(
     return join(
         mapped_r, mapped_g, mapped_b, family=vs.ColorFamily.RGB
     ).std.SetFrameProps(
-        _Matrix=0, _Transfer=14, _Primaries=9 if colorspace == "2020" else 1
+        _Matrix=0,
+        _Transfer=14 if colorspace == "2020" else 1,
+        _Primaries=9 if colorspace == "2020" else 1,
     )
 
 
