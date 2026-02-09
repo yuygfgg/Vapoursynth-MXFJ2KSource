@@ -6,6 +6,7 @@ def xyz2rgb(
     clip: vs.VideoNode,
     gamma: float = 2.2,
     colorspace: Literal["709", "2020"] = "2020",
+    chromatic_adaptation: bool = True,
     vulkan: bool = False,
 ) -> vs.VideoNode:
     """Convert from XYZ color space to RGB color space with gamma correction."""
@@ -25,12 +26,21 @@ def xyz2rgb(
         X_lin = X_raw * (52.37 / 48);
         Y_lin = Y_raw * (52.37 / 48);
         Z_lin = Z_raw * (52.37 / 48);
-
-        # Chromatic Adaptation (D65)
-        X_d65 = 1.02449673 * X_lin + 0.01516354 * Y_lin - 0.01968852 * Z_lin;
-        Y_d65 = 0.02561219 * X_lin + 0.97258631 * Y_lin - 0.00471635 * Z_lin;
-        Z_d65 = 0.00638423 * X_lin + -0.01226808 * Y_lin + 1.14794245 * Z_lin;
     """
+
+    # Chromatic Adaptation (D65)
+    if chromatic_adaptation:
+        common_expr += """
+            X_d65 = 1.02449673 * X_lin + 0.01516354 * Y_lin - 0.01968852 * Z_lin;
+            Y_d65 = 0.02561219 * X_lin + 0.97258631 * Y_lin - 0.00471635 * Z_lin;
+            Z_d65 = 0.00638423 * X_lin + -0.01226808 * Y_lin + 1.14794245 * Z_lin;
+        """
+    else:
+        common_expr += """
+            X_d65 = X_lin;
+            Y_d65 = Y_lin;
+            Z_d65 = Z_lin;
+        """
 
     # XYZ to Linear RGB
     if colorspace == "709":
