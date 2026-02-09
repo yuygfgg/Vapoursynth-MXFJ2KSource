@@ -60,9 +60,11 @@ jobs:
             -DGRK_BUILD_CORE_EXAMPLES=OFF \
             -DGRK_BUILD_CODEC_EXAMPLES=OFF \
             -DGRK_ENABLE_EXIFTOOL=OFF \
-            -DGRK_BUILD_LIBPNG=OFF \
-            -DGRK_BUILD_LIBTIFF=OFF \
+            -DGRK_BUILD_LIBPNG=ON \
+            -DGRK_BUILD_LIBTIFF=ON \
             -DGRK_BUILD_JPEG=OFF \
+            -DCMAKE_C_FLAGS='-flto' \
+            -DCMAKE_CXX_FLAGS='-flto' \
             -DCMAKE_INSTALL_PREFIX="$prefix"
 
           cmake --build grok-build --parallel --target grokj2kcodec bundling_target
