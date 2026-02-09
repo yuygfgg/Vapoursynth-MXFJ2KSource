@@ -74,9 +74,22 @@ static constexpr int VAPOURSYNTH_RGB36_BITS = 12;
 static constexpr int VAPOURSYNTH_RGB48_BITS = 16;
 static constexpr size_t FRAME_INDEX_RESERVE = 4096;
 
-static void grok_init_once() {
+static void grok_init_once(uint32_t threads, VSCore* core = nullptr,
+                           const VSAPI* vsapi = nullptr) {
     static std::once_flag once;
-    std::call_once(once, []() { grk_initialize(nullptr, 0, nullptr); });
+    static uint32_t init_threads = 0;
+    std::call_once(once, [threads]() {
+        grk_initialize(nullptr, threads, nullptr);
+        init_threads = threads;
+    });
+
+    if ((threads != init_threads) && (core != nullptr) && (vsapi != nullptr)) {
+        const std::string msg = std::format(
+            "MXFJ2KSource: Grok thread pool is process-global; ignoring "
+            "threads={} (already initialized with threads={})",
+            threads, init_threads);
+        vsapi->logMessage(mtWarning, msg.c_str(), core);
+    }
 }
 
 struct FrameIndex {
@@ -175,7 +188,7 @@ using GrokCodecPtr = std::unique_ptr<grk_object, GrokCodecDeleter>;
 
 [[nodiscard]] static std::expected<GrokCodecPtr, std::string>
 grok_init_codec_and_read_header(std::span<uint8_t> buf) {
-    grok_init_once();
+    grok_init_once(0);
 
     grk_stream_params sp{};
     sp.buf = buf.data();
@@ -1229,6 +1242,22 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
                 : std::optional<fs::path>(
                       path_from_utf8(src).concat(".mxfj2kindex"));
 
+        const int64_t threads_i = vsapi->mapGetInt(in, "threads", 0, &err);
+        uint32_t grok_threads = 1;
+        if (err == 0) {
+            if (threads_i < 0) {
+                vsapi->mapSetError(out, "Source: 'threads' must be >= 0");
+                return;
+            }
+            if (threads_i >
+                static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+                vsapi->mapSetError(out, "Source: 'threads' out of range");
+                return;
+            }
+            grok_threads = static_cast<uint32_t>(threads_i);
+        }
+        grok_init_once(grok_threads, core, vsapi);
+
         VideoTrackInfo track_info{};
         if (auto track_info_exp = probe_mxf_video_track(src); track_info_exp) {
             track_info = *track_info_exp;
@@ -1377,7 +1406,7 @@ static void VS_CC mxfj2k_create(const VSMap* in, VSMap* out, void* /*unused*/,
         vsh::reduceRational(&d->vi.fpsNum, &d->vi.fpsDen);
 
         vsapi->createVideoFilter(out, "Source", &d->vi, mxfj2k_get_frame,
-                                 mxfj2k_free, fmUnordered, nullptr, 0, d.get(),
+                                 mxfj2k_free, fmParallel, nullptr, 0, d.get(),
                                  core);
         (void)d.release();
     } catch (const std::exception& e) {
@@ -1397,6 +1426,7 @@ VapourSynthPluginInit2( // NOLINT(readability-identifier-naming)
                          "JPEG 2000 MXF source", VS_MAKE_VERSION(1, 1),
                          VAPOURSYNTH_API_VERSION, 0, plugin);
     vspapi->registerFunction(
-        "Source", "source:data;track:int:opt;cache_path:data:opt;",
+        "Source",
+        "source:data;track:int:opt;cache_path:data:opt;threads:int:opt",
         "clip:vnode;", mxfj2ksource::mxfj2k_create, nullptr, plugin);
 }

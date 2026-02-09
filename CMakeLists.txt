@@ -53,8 +53,40 @@ add_subdirectory(third_party/libMXFpp)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(VAPOURSYNTH REQUIRED vapoursynth)
 
-# grokj2k is expected to be installed
-pkg_check_modules(GROK REQUIRED IMPORTED_TARGET libgrokj2kcodec)
+option(MXFJ2K_USE_BUNDLED_GROK "Link against a locally built Grok) instead of pkg-config" OFF)
+set(MXFJ2K_GROK_SOURCE_DIR "" CACHE PATH "Path to grok source tree")
+set(MXFJ2K_GROK_BUILD_DIR "" CACHE PATH "Path to grok build tree")
+
+if(MXFJ2K_USE_BUNDLED_GROK)
+    if(NOT MXFJ2K_GROK_SOURCE_DIR)
+        set(MXFJ2K_GROK_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/_deps/grok-src" CACHE PATH "" FORCE)
+    endif()
+    if(NOT MXFJ2K_GROK_BUILD_DIR)
+        set(MXFJ2K_GROK_BUILD_DIR "${CMAKE_SOURCE_DIR}/third_party/_deps/grok-build" CACHE PATH "" FORCE)
+    endif()
+
+    set(GROK_INCLUDE_DIRS
+        "${MXFJ2K_GROK_SOURCE_DIR}/src/lib/core"
+        "${MXFJ2K_GROK_BUILD_DIR}/src/lib/core"
+    )
+
+    set(GROK_LIBRARY_DIR "${MXFJ2K_GROK_BUILD_DIR}/bin")
+    set(GROK_LIBRARIES
+        "${GROK_LIBRARY_DIR}/libgrokj2kcodec.a"
+        "${GROK_LIBRARY_DIR}/libgrokj2k.a"
+        "${GROK_LIBRARY_DIR}/libhwy.a"
+        "${GROK_LIBRARY_DIR}/liblcms2.a"
+    )
+
+    foreach(path IN LISTS GROK_LIBRARIES)
+        if(NOT EXISTS "${path}")
+            message(FATAL_ERROR "Bundled Grok library not found: ${path}")
+        endif()
+    endforeach()
+else()
+    # grokj2k is expected to be installed
+    pkg_check_modules(GROK REQUIRED IMPORTED_TARGET libgrokj2kcodec)
+endif()
 
 add_library(MXFJ2KSource SHARED
     lib/MXFJ2KSource.cpp
@@ -66,10 +98,17 @@ target_include_directories(MXFJ2KSource PRIVATE
 
 target_link_libraries(MXFJ2KSource PRIVATE
     MXFpp
-    PkgConfig::GROK
 )
 
-if(MXFJ2K_PREFER_STATIC AND WIN32)
+if(MXFJ2K_USE_BUNDLED_GROK)
+    target_include_directories(MXFJ2KSource PRIVATE ${GROK_INCLUDE_DIRS})
+    target_link_libraries(MXFJ2KSource PRIVATE ${GROK_LIBRARIES})
+    target_compile_definitions(MXFJ2KSource PRIVATE GRK_STATIC)
+else()
+    target_link_libraries(MXFJ2KSource PRIVATE PkgConfig::GROK)
+endif()
+
+if(MXFJ2K_PREFER_STATIC AND WIN32 AND NOT MXFJ2K_USE_BUNDLED_GROK)
     target_compile_definitions(MXFJ2KSource PRIVATE GRK_STATIC)
 endif()
 

@@ -1,3 +1,4 @@
 .cache/*
 .DS_Store
-build/*
+build*/*
+third_party/_deps/
