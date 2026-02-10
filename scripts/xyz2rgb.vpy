@@ -57,9 +57,9 @@ def xyz2rgb(
         """
 
     # Gamma Correction
-    expr_r = common_expr + f"RESULT = R_lin ** (1.0 / {gamma});"
-    expr_g = common_expr + f"RESULT = G_lin ** (1.0 / {gamma});"
-    expr_b = common_expr + f"RESULT = B_lin ** (1.0 / {gamma});"
+    expr_r = common_expr + f"RESULT = max(R_lin, 0.0) ** (1.0 / {gamma});"
+    expr_g = common_expr + f"RESULT = max(G_lin, 0.0) ** (1.0 / {gamma});"
+    expr_b = common_expr + f"RESULT = max(B_lin, 0.0) ** (1.0 / {gamma});"
 
     mapped_r = expr_func(clips=[X_plane, Y_plane, Z_plane], expr=[expr_r], infix=1)
     mapped_g = expr_func(clips=[X_plane, Y_plane, Z_plane], expr=[expr_g], infix=1)
