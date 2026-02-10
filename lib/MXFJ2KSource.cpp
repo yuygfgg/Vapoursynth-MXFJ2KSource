@@ -74,6 +74,7 @@ static constexpr int VAPOURSYNTH_RGB36_BITS = 12;
 static constexpr int VAPOURSYNTH_RGB48_BITS = 16;
 static constexpr size_t FRAME_INDEX_RESERVE = 4096;
 
+// NOLINTNEXTLINE(readability-non-const-parameter)
 static void grok_init_once(uint32_t threads, VSCore* core = nullptr,
                            const VSAPI* vsapi = nullptr) {
     static std::once_flag once;

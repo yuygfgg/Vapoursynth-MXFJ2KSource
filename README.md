@@ -24,8 +24,6 @@ Notes / limitations:
 
 - **Supported Formats**: Only 12-bit and 16-bit 4:4:4 (full-resolution) JPEG 2000.
 
-- **Note**: Unless you are dealing with DCPs or file in XYZ colorspace, standard source filters are recommended.
-
 ## Building
 
 Requirements:
@@ -39,3 +37,8 @@ cmake --build build -j
 
 Output:
 - `build/libMXFJ2KSource.[dll|dylib|so]`
+
+# Notes
+
+ - Unless you are dealing with DCPs or file in XYZ colorspace, standard source filters are recommended.
+ - To convert XYZ to RGB, refer to [scripts/xyz2rgb.vpy](scripts/xyz2rgb.vpy) (Requires [Vapoursynth-llvmexpr](https://github.com/Sunflower-Dolls/Vapoursynth-llvmexpr) to be installed).
