@@ -127,6 +127,8 @@ class CustomBuildHook(BuildHookInterface):
                 ]
             )
 
+        self._patch_grok_source(source_dir)
+
         expected_libs = [
             build_dir / "bin" / "libgrokj2kcodec.a",
             build_dir / "bin" / "libgrokj2k.a",
@@ -177,6 +179,20 @@ class CustomBuildHook(BuildHookInterface):
             raise RuntimeError(f"Bundled Grok build did not produce expected libraries: {', '.join(missing)}")
 
         return source_dir, build_dir
+
+    def _patch_grok_source(self, source_dir: Path) -> None:
+        mem_manager = source_dir / "src" / "lib" / "core" / "util" / "MemManager.h"
+        text = mem_manager.read_text()
+        patched = text.replace(
+            "#elif defined(__linux__)\n#include <malloc.h>",
+            "#elif defined(__linux__) && defined(__GLIBC__)\n#include <malloc.h>",
+        )
+        patched = patched.replace(
+            "#ifdef __linux__\n    malloc_trim(0);\n#elif defined(_WIN32)",
+            "#if defined(__linux__) && defined(__GLIBC__)\n    malloc_trim(0);\n#elif defined(_WIN32)",
+        )
+        if patched != text:
+            mem_manager.write_text(patched)
 
     def _build_grok_libraries(self, build_dir: Path, expected_libs: list[Path]) -> None:
         self._run(

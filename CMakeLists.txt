@@ -52,6 +52,7 @@ add_subdirectory(third_party/libMXFpp)
 
 find_package(Python3 COMPONENTS Interpreter)
 find_package(PkgConfig)
+find_package(Threads REQUIRED)
 
 set(VAPOURSYNTH_INCLUDE_DIRECTORY "" CACHE PATH "Path to VapourSynth headers")
 if(NOT VAPOURSYNTH_INCLUDE_DIRECTORY AND Python3_Interpreter_FOUND)
@@ -157,6 +158,7 @@ target_include_directories(MXFJ2KSource PRIVATE
 
 target_link_libraries(MXFJ2KSource PRIVATE
     MXFpp
+    Threads::Threads
 )
 
 if(MXFJ2K_USE_BUNDLED_GROK)
