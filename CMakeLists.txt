@@ -50,10 +50,35 @@ set(LIBMXFPP_BUILD_LIBMXF_LIB OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third_party/libMXFpp)
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(VAPOURSYNTH REQUIRED vapoursynth)
+find_package(Python3 COMPONENTS Interpreter)
+find_package(PkgConfig)
 
-option(MXFJ2K_USE_BUNDLED_GROK "Link against a locally built Grok) instead of pkg-config" OFF)
+set(VAPOURSYNTH_INCLUDE_DIRECTORY "" CACHE PATH "Path to VapourSynth headers")
+if(NOT VAPOURSYNTH_INCLUDE_DIRECTORY AND Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -c "import vapoursynth; print(vapoursynth.get_include(), end='')"
+        OUTPUT_VARIABLE VAPOURSYNTH_INCLUDE_DIRECTORY
+        RESULT_VARIABLE VAPOURSYNTH_INCLUDE_RESULT
+        ERROR_QUIET
+    )
+    if(VAPOURSYNTH_INCLUDE_RESULT)
+        unset(VAPOURSYNTH_INCLUDE_DIRECTORY CACHE)
+        set(VAPOURSYNTH_INCLUDE_DIRECTORY "" CACHE PATH "Path to VapourSynth headers")
+    endif()
+endif()
+
+if(NOT VAPOURSYNTH_INCLUDE_DIRECTORY AND PkgConfig_FOUND)
+    pkg_check_modules(VAPOURSYNTH vapoursynth)
+    if(VAPOURSYNTH_FOUND)
+        set(VAPOURSYNTH_INCLUDE_DIRECTORY "${VAPOURSYNTH_INCLUDE_DIRS}" CACHE PATH "Path to VapourSynth headers" FORCE)
+    endif()
+endif()
+
+if(NOT VAPOURSYNTH_INCLUDE_DIRECTORY)
+    message(FATAL_ERROR "VapourSynth headers were not found. Install VapourSynth from PyPI or pass -DVAPOURSYNTH_INCLUDE_DIRECTORY=/path/to/vapoursynth/include.")
+endif()
+
+option(MXFJ2K_USE_BUNDLED_GROK "Link against a locally built Grok instead of pkg-config" OFF)
 set(MXFJ2K_GROK_SOURCE_DIR "" CACHE PATH "Path to grok source tree")
 set(MXFJ2K_GROK_BUILD_DIR "" CACHE PATH "Path to grok build tree")
 
@@ -74,17 +99,31 @@ if(MXFJ2K_USE_BUNDLED_GROK)
     set(GROK_LIBRARIES
         "${GROK_LIBRARY_DIR}/libgrokj2kcodec.a"
         "${GROK_LIBRARY_DIR}/libgrokj2k.a"
+        "${GROK_LIBRARY_DIR}/libspdlog.a"
+        "${GROK_LIBRARY_DIR}/libfmt.a"
         "${GROK_LIBRARY_DIR}/libhwy.a"
         "${GROK_LIBRARY_DIR}/liblcms2.a"
     )
 
+    set(GROK_OPTIONAL_LIBRARIES
+        "${GROK_LIBRARY_DIR}/libspdlog.a"
+        "${GROK_LIBRARY_DIR}/libfmt.a"
+    )
+
     foreach(path IN LISTS GROK_LIBRARIES)
+        if(path IN_LIST GROK_OPTIONAL_LIBRARIES AND NOT EXISTS "${path}")
+            list(REMOVE_ITEM GROK_LIBRARIES "${path}")
+            continue()
+        endif()
         if(NOT EXISTS "${path}")
             message(FATAL_ERROR "Bundled Grok library not found: ${path}")
         endif()
     endforeach()
 else()
     # grokj2k is expected to be installed
+    if(NOT PkgConfig_FOUND)
+        message(FATAL_ERROR "pkg-config is required when MXFJ2K_USE_BUNDLED_GROK is OFF")
+    endif()
     pkg_check_modules(GROK REQUIRED IMPORTED_TARGET libgrokj2kcodec)
 endif()
 
@@ -92,8 +131,12 @@ add_library(MXFJ2KSource SHARED
     lib/MXFJ2KSource.cpp
 )
 
+set_target_properties(MXFJ2KSource PROPERTIES
+    PREFIX "lib"
+)
+
 target_include_directories(MXFJ2KSource PRIVATE
-    "${VAPOURSYNTH_INCLUDE_DIRS}"
+    "${VAPOURSYNTH_INCLUDE_DIRECTORY}"
 )
 
 target_link_libraries(MXFJ2KSource PRIVATE
@@ -124,3 +167,19 @@ if(MXFJ2K_PREFER_STATIC AND MINGW)
         -Wl,--no-whole-archive
     )
 endif()
+
+if(MXFJ2K_PREFER_STATIC AND NOT APPLE AND NOT MSVC AND NOT MINGW)
+    target_link_options(MXFJ2KSource PRIVATE
+        -static-libgcc
+        -static-libstdc++
+    )
+endif()
+
+include(GNUInstallDirs)
+install(TARGETS MXFJ2KSource
+    LIBRARY DESTINATION "vapoursynth/plugins/mxfj2ksource"
+    RUNTIME DESTINATION "vapoursynth/plugins/mxfj2ksource"
+)
+install(FILES "packaging/manifest.vs"
+    DESTINATION "vapoursynth/plugins/mxfj2ksource"
+)

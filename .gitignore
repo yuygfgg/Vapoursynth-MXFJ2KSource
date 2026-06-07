@@ -2,3 +2,8 @@
 .DS_Store
 build*/*
 third_party/_deps/
+dist/
+wheelhouse/
+vapoursynth/
+*.egg-info/
+__pycache__/
