@@ -81,6 +81,7 @@ endif()
 option(MXFJ2K_USE_BUNDLED_GROK "Link against a locally built Grok instead of pkg-config" OFF)
 set(MXFJ2K_GROK_SOURCE_DIR "" CACHE PATH "Path to grok source tree")
 set(MXFJ2K_GROK_BUILD_DIR "" CACHE PATH "Path to grok build tree")
+option(MXFJ2K_GROK_EXTERNAL_FMT "Link bundled Grok/spdlog against an external fmt library" OFF)
 
 if(MXFJ2K_USE_BUNDLED_GROK)
     if(NOT MXFJ2K_GROK_SOURCE_DIR)
@@ -100,10 +101,13 @@ if(MXFJ2K_USE_BUNDLED_GROK)
         "${GROK_LIBRARY_DIR}/libgrokj2kcodec.a"
         "${GROK_LIBRARY_DIR}/libgrokj2k.a"
         "${GROK_LIBRARY_DIR}/libspdlog.a"
-        "${GROK_LIBRARY_DIR}/libfmt.a"
         "${GROK_LIBRARY_DIR}/libhwy.a"
         "${GROK_LIBRARY_DIR}/liblcms2.a"
     )
+
+    if(NOT MXFJ2K_GROK_EXTERNAL_FMT)
+        list(APPEND GROK_LIBRARIES "${GROK_LIBRARY_DIR}/libfmt.a")
+    endif()
 
     set(GROK_OPTIONAL_LIBRARIES
         "${GROK_LIBRARY_DIR}/libspdlog.a"
@@ -119,6 +123,18 @@ if(MXFJ2K_USE_BUNDLED_GROK)
             message(FATAL_ERROR "Bundled Grok library not found: ${path}")
         endif()
     endforeach()
+
+    if(MXFJ2K_GROK_EXTERNAL_FMT)
+        find_path(FMT_INCLUDE_DIRECTORY
+            NAMES fmt/core.h
+        )
+        find_library(FMT_LIBRARY
+            NAMES fmt
+        )
+        if(NOT FMT_INCLUDE_DIRECTORY OR NOT FMT_LIBRARY)
+            message(FATAL_ERROR "External fmt dependency not found")
+        endif()
+    endif()
 else()
     # grokj2k is expected to be installed
     if(NOT PkgConfig_FOUND)
@@ -147,6 +163,10 @@ if(MXFJ2K_USE_BUNDLED_GROK)
     target_include_directories(MXFJ2KSource PRIVATE ${GROK_INCLUDE_DIRS})
     target_link_libraries(MXFJ2KSource PRIVATE ${GROK_LIBRARIES})
     target_compile_definitions(MXFJ2KSource PRIVATE GRK_STATIC)
+    if(MXFJ2K_GROK_EXTERNAL_FMT)
+        target_include_directories(MXFJ2KSource PRIVATE "${FMT_INCLUDE_DIRECTORY}")
+        target_link_libraries(MXFJ2KSource PRIVATE "${FMT_LIBRARY}")
+    endif()
 else()
     target_link_libraries(MXFJ2KSource PRIVATE PkgConfig::GROK)
 endif()

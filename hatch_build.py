@@ -85,6 +85,9 @@ class CustomBuildHook(BuildHookInterface):
             f"-DVAPOURSYNTH_INCLUDE_DIRECTORY={vapoursynth.get_include()}",
         ]
 
+        if self._truthy(env.get("MXFJ2K_GROK_EXTERNAL_FMT")):
+            args.append("-DMXFJ2K_GROK_EXTERNAL_FMT=ON")
+
         if sys.platform == "darwin":
             deployment_target = env.get("MACOSX_DEPLOYMENT_TARGET", "14.0")
             os.environ["MACOSX_DEPLOYMENT_TARGET"] = deployment_target
@@ -106,6 +109,7 @@ class CustomBuildHook(BuildHookInterface):
         default_base = root / "build" / "hatch" / "deps"
         source_dir = Path(env.get("MXFJ2K_GROK_SOURCE_DIR", default_base / f"grok-src-{safe_ref}")).resolve()
         build_dir = Path(env.get("MXFJ2K_GROK_BUILD_DIR", default_base / f"grok-build-{safe_ref}-{self._build_dir_name()}-minimal")).resolve()
+        external_fmt = self._truthy(env.get("MXFJ2K_GROK_EXTERNAL_FMT"))
 
         if not source_dir.exists():
             source_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -127,10 +131,12 @@ class CustomBuildHook(BuildHookInterface):
             build_dir / "bin" / "libgrokj2kcodec.a",
             build_dir / "bin" / "libgrokj2k.a",
             build_dir / "bin" / "libspdlog.a",
-            build_dir / "bin" / "libfmt.a",
             build_dir / "bin" / "libhwy.a",
             build_dir / "bin" / "liblcms2.a",
         ]
+        if not external_fmt:
+            expected_libs.append(build_dir / "bin" / "libfmt.a")
+
         if all(path.exists() for path in expected_libs):
             return source_dir, build_dir
 
@@ -161,6 +167,7 @@ class CustomBuildHook(BuildHookInterface):
                 "-DCMAKE_DISABLE_FIND_PACKAGE_JPEG=ON",
                 "-DCMAKE_DISABLE_FIND_PACKAGE_PNG=ON",
                 "-DCMAKE_DISABLE_FIND_PACKAGE_TIFF=ON",
+                f"-DSPDLOG_FMT_EXTERNAL={'ON' if external_fmt else 'OFF'}",
             ]
         )
         self._build_grok_libraries(build_dir, expected_libs)
