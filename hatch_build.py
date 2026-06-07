@@ -194,6 +194,43 @@ class CustomBuildHook(BuildHookInterface):
         if patched != text:
             mem_manager.write_text(patched)
 
+        stream_io = source_dir / "src" / "lib" / "core" / "stream" / "StreamIO.h"
+        text = stream_io.read_text()
+        patched = text.replace(
+            """#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \\
+    defined(__OpenBSD__) // POSIX with byteswap.h
+#include <byteswap.h>
+  if(numBytes == 8)
+  {
+    *value = (TYPE)bswap_64((uint64_t)*value);
+  }
+  else if(numBytes == 4)
+  {
+    *value = (TYPE)bswap_32((uint32_t)*value);
+  }
+  else if(numBytes == 2)
+  {
+    *value = (TYPE)bswap_16((uint16_t)*value);
+  }
+""",
+            """#elif defined(__GNUC__) || defined(__clang__)
+  if(numBytes == 8)
+  {
+    *value = (TYPE)__builtin_bswap64((uint64_t)*value);
+  }
+  else if(numBytes == 4)
+  {
+    *value = (TYPE)__builtin_bswap32((uint32_t)*value);
+  }
+  else if(numBytes == 2)
+  {
+    *value = (TYPE)__builtin_bswap16((uint16_t)*value);
+  }
+""",
+        )
+        if patched != text:
+            stream_io.write_text(patched)
+
     def _build_grok_libraries(self, build_dir: Path, expected_libs: list[Path]) -> None:
         self._run(
             [
